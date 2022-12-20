@@ -173,6 +173,86 @@ TEST(String, ToString) {
 }
 #endif
 
+KJ_TEST("string literals with _kj suffix") {
+  static constexpr StringPtr FOO = "foo"_kj;
+  KJ_EXPECT(FOO == "foo", FOO);
+  KJ_EXPECT(FOO[3] == 0);
+
+  KJ_EXPECT("foo\0bar"_kj == StringPtr("foo\0bar", 7));
+
+  static constexpr ArrayPtr<const char> ARR = "foo"_kj;
+  KJ_EXPECT(ARR.size() == 3);
+  KJ_EXPECT(kj::str(ARR) == "foo");
+}
+
+KJ_TEST("kj::delimited() and kj::strPreallocated()") {
+  int rawArray[] = {1, 23, 456, 78};
+  ArrayPtr<int> array = rawArray;
+  KJ_EXPECT(str(delimited(array, "::")) == "1::23::456::78");
+
+  {
+    char buffer[256];
+    KJ_EXPECT(strPreallocated(buffer, delimited(array, "::"), 'x')
+        == "1::23::456::78x");
+    KJ_EXPECT(strPreallocated(buffer, "foo", 123, true) == "foo123true");
+  }
+
+  {
+    char buffer[5];
+    KJ_EXPECT(strPreallocated(buffer, delimited(array, "::"), 'x') == "1::2");
+    KJ_EXPECT(strPreallocated(buffer, "foo", 123, true) == "foo1");
+  }
+}
+
+KJ_TEST("parsing 'nan' returns canonical NaN value") {
+  // There are many representations of NaN. We would prefer that parsing "NaN" produces exactly the
+  // same bits that kj::nan() returns.
+  {
+    double parsedNan = StringPtr("NaN").parseAs<double>();
+    double canonicalNan = kj::nan();
+    KJ_EXPECT(memcmp(&parsedNan, &canonicalNan, sizeof(parsedNan)) == 0);
+  }
+  {
+    float parsedNan = StringPtr("NaN").parseAs<float>();
+    float canonicalNan = kj::nan();
+    KJ_EXPECT(memcmp(&parsedNan, &canonicalNan, sizeof(parsedNan)) == 0);
+  }
+}
+
+KJ_TEST("stringify array-of-array") {
+  int arr1[] = {1, 23};
+  int arr2[] = {456, 7890};
+  ArrayPtr<int> arr3[] = {arr1, arr2};
+  ArrayPtr<ArrayPtr<int>> array = arr3;
+
+  KJ_EXPECT(str(array) == "1, 23, 456, 7890");
+}
+
+KJ_TEST("ArrayPtr == StringPtr") {
+  StringPtr s = "foo"_kj;
+  ArrayPtr<const char> a = s;
+
+  KJ_EXPECT(a == s);
+#if __cplusplus >= 202000L
+  KJ_EXPECT(s == a);
+#endif
+}
+
+KJ_TEST("String == String") {
+  String a = kj::str("foo");
+  String b = kj::str("foo");
+  String c = kj::str("bar");
+
+  // We're trying to trigger the -Wambiguous-reversed-operator warning in Clang, but it seems
+  // magic asserts inadvertently squelch it. So, we use an alternate macro with no magic.
+#define KJ_EXPECT_NOMAGIC(cond) \
+    if (cond) {} else { KJ_FAIL_ASSERT("expected " #cond); }
+
+  KJ_EXPECT_NOMAGIC(a == a);
+  KJ_EXPECT_NOMAGIC(a == b);
+  KJ_EXPECT_NOMAGIC(a != c);
+}
+
 }  // namespace
 }  // namespace _ (private)
 }  // namespace kj
