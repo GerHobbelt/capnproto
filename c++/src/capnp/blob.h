@@ -174,8 +174,11 @@ inline kj::StringPtr KJ_STRINGIFY(Text::Builder builder) {
   return builder.asString();
 }
 
+// NOTE(paris): This is only needed when compiling for wasm, i.e. bazel build @capnproto//:capnp-lib --config=wasm
+#if __cplusplus < 202000L
 inline bool operator==(const char* a, const Text::Builder& b) { return a == b.asString(); }
 inline bool operator!=(const char* a, const Text::Builder& b) { return a != b.asString(); }
+#endif
 
 inline Text::Builder::operator kj::StringPtr() const {
   return kj::StringPtr(content.begin(), content.size() - 1);
