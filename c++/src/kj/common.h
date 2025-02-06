@@ -1026,24 +1026,26 @@ private:
 
 // We want placement new, but we don't want to #include <new>.  operator new cannot be defined in
 // a namespace, and defining it globally conflicts with the definition in <new>.  So we have to
-// define a dummy type and an operator new that uses it.
+// define a dummy type and an operator new that uses it. The dummy type is intentionally passed
+// as the last parameter to avoid an ABI issues caused by GCC and clang using incompatible calling
+// conventions for passing empty struct parameters.
 
 namespace _ {  // private
 struct PlacementNew {};
 }  // namespace _ (private)
 } // namespace kj
 
-inline void* operator new(size_t, kj::_::PlacementNew, void* __p) noexcept {
+inline void* operator new(size_t, void* __p, kj::_::PlacementNew) noexcept {
   return __p;
 }
 
-inline void operator delete(void*, kj::_::PlacementNew, void* __p) noexcept {}
+inline void operator delete(void*, void* __p, kj::_::PlacementNew) noexcept {}
 
 namespace kj {
 
 template <typename T, typename... Params>
 inline void ctor(T& location, Params&&... params) {
-  new (_::PlacementNew(), &location) T(kj::fwd<Params>(params)...);
+  new (&location, _::PlacementNew()) T(kj::fwd<Params>(params)...);
 }
 
 template <typename T>
