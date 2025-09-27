@@ -867,12 +867,6 @@ private:
   const void* brand;
 };
 
-class RevocableClientHook: public ClientHook {
-public:
-  virtual void revoke() = 0;
-  virtual void revoke(kj::Exception&& reason) = 0;
-};
-
 class CallContextHook {
   // Hook interface implemented by RPC system to manage a call on the server side.  See
   // CallContext<T>.
@@ -910,6 +904,9 @@ kj::Own<ClientHook> newLocalPromiseClient(kj::Promise<kj::Own<ClientHook>>&& pro
 kj::Own<PipelineHook> newLocalPromisePipeline(kj::Promise<kj::Own<PipelineHook>>&& promise);
 // Returns a PipelineHook that queues up calls until `promise` resolves, then forwards them to
 // the new pipeline.
+
+kj::Own<PipelineHook> newLocalPipeline(kj::Own<void> owner, AnyPointer::Reader results);
+// Create a PipelineHook that's simply backed by the given results message.
 
 kj::Own<ClientHook> newBrokenCap(kj::StringPtr reason);
 kj::Own<ClientHook> newBrokenCap(kj::Exception&& reason);
