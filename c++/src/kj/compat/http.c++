@@ -415,6 +415,7 @@ static kj::Maybe<kj::OneOf<HttpMethod, HttpConnectMethod>> consumeHttpMethod(cha
           }
         default: return kj::none;
       }
+    case 'Q': EXPECT_REST(Q,UERY)
     case 'R': EXPECT_REST(R,EPORT)
     case 'S':
       switch (*p++) {
@@ -430,6 +431,7 @@ static kj::Maybe<kj::OneOf<HttpMethod, HttpConnectMethod>> consumeHttpMethod(cha
         case 'S': EXPECT_REST(UNS,UBSCRIBE)
         default: return kj::none;
       }
+    
     default: return kj::none;
   }
 #undef EXPECT_REST
@@ -1791,7 +1793,7 @@ private:
           maxBytes = kj::min(maxBytes, MAX_CHUNK_HEADER_SIZE);
         }
 
-        readPromise = inner.read(headerBuffer.begin() + bufferEnd, 1, maxBytes);
+        readPromise = inner.read(headerBuffer.slice(bufferEnd).first(maxBytes).asBytes(), 1);
       }
 
       auto amount = co_await readPromise;
