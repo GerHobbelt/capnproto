@@ -144,7 +144,7 @@ public:
       : ptr(firstElement), size_(size), disposer(&disposer) {}
 
   KJ_DISALLOW_COPY(Array);
-  inline ~Array() noexcept { dispose(); }
+  inline ~Array() noexcept(false) { dispose(); }
 
   inline operator ArrayPtr<T>() KJ_LIFETIMEBOUND {
     return ArrayPtr<T>(ptr, size_);
@@ -161,11 +161,11 @@ public:
 
   inline constexpr size_t size() const { return size_; }
   inline constexpr T& operator[](size_t index) KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.");
+    KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.", index, size_);
     return ptr[index];
   }
   inline constexpr const T& operator[](size_t index) const KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.");
+    KJ_IREQUIRE(index < size_, "Out-of-bounds Array access.", index, size_);
     return ptr[index];
   }
 
@@ -182,40 +182,40 @@ public:
   inline bool operator==(const U& other) const { return asPtr() == other; }
 
   inline ArrayPtr<T> slice(size_t start, size_t end) KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds Array::slice().");
+    KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds Array::slice().", start, end, size_);
     return ArrayPtr<T>(ptr + start, end - start);
   }
   inline ArrayPtr<const T> slice(size_t start, size_t end) const KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds Array::slice().");
+    KJ_IREQUIRE(start <= end && end <= size_, "Out-of-bounds Array::slice().", start, end, size_);
     return ArrayPtr<const T>(ptr + start, end - start);
   }
   inline ArrayPtr<T> slice(size_t start) KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().");
+    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().", start, size_);
     return ArrayPtr<T>(ptr + start, size_ - start);
   }
   inline ArrayPtr<const T> slice(size_t start) const KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().");
+    KJ_IREQUIRE(start <= size_, "Out-of-bounds ArrayPtr::slice().", start, size_);
     return ArrayPtr<const T>(ptr + start, size_ - start);
   }
 
   inline ArrayPtr<T> first(size_t count) KJ_LIFETIMEBOUND { return slice(0, count); }
   inline ArrayPtr<const T> first(size_t count) const KJ_LIFETIMEBOUND { return slice(0, count); }
 
-  inline ArrayPtr<const byte> asBytes() const KJ_LIFETIMEBOUND { 
+  inline ArrayPtr<const byte> asBytes() const KJ_LIFETIMEBOUND {
     KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
-    return asPtr().asBytes(); 
+    return asPtr().asBytes();
   }
-  inline ArrayPtr<PropagateConst<T, byte>> asBytes() KJ_LIFETIMEBOUND { 
+  inline ArrayPtr<PropagateConst<T, byte>> asBytes() KJ_LIFETIMEBOUND {
     KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
-    return asPtr().asBytes(); 
+    return asPtr().asBytes();
   }
-  inline ArrayPtr<const char> asChars() const KJ_LIFETIMEBOUND { 
+  inline ArrayPtr<const char> asChars() const KJ_LIFETIMEBOUND {
     KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
-    return asPtr().asChars(); 
+    return asPtr().asChars();
   }
-  inline ArrayPtr<PropagateConst<T, char>> asChars() KJ_LIFETIMEBOUND { 
+  inline ArrayPtr<PropagateConst<T, char>> asChars() KJ_LIFETIMEBOUND {
     KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
-    return asPtr().asChars(); 
+    return asPtr().asChars();
   }
 
   inline Array<PropagateConst<T, byte>> releaseAsBytes() {
@@ -263,13 +263,13 @@ public:
   // Like Own<T>::attach(), but attaches to an Array.
 
   template <typename U>
-  inline auto as() { return U::from(this); }
-  // Syntax sugar for invoking U::from.
+  inline auto as() { return asImpl((U*)nullptr, *this); }
+  // Syntax sugar for invoking asImpl(U*, Array&).
   // Used to chain conversion calls rather than wrap with function.
 
   template <typename U>
-  inline auto as() const { return U::from(this); }
-  // Syntax sugar for invoking U::from.
+  inline auto as() const { return asImpl((U*)nullptr, *this); }
+  // Syntax sugar for invoking asImpl(U*, const Array&).
   // Used to chain conversion calls rather than wrap with function.
 
 private:
@@ -399,11 +399,13 @@ public:
   inline size_t size() const { return pos - ptr; }
   inline size_t capacity() const { return endPtr - ptr; }
   inline T& operator[](size_t index) KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(index < implicitCast<size_t>(pos - ptr), "Out-of-bounds Array access.");
+    KJ_IREQUIRE(index < implicitCast<size_t>(pos - ptr),
+        "Out-of-bounds Array access.", index, pos-ptr);
     return ptr[index];
   }
   inline const T& operator[](size_t index) const KJ_LIFETIMEBOUND {
-    KJ_IREQUIRE(index < implicitCast<size_t>(pos - ptr), "Out-of-bounds Array access.");
+    KJ_IREQUIRE(index < implicitCast<size_t>(pos - ptr),
+        "Out-of-bounds Array access.", index, pos-ptr);
     return ptr[index];
   }
 
@@ -627,6 +629,63 @@ private:
 };
 
 // =======================================================================================
+// Small-buffer-optimized SmallArray
+//
+// SmallArray is useful when you need a temporary buffer, whose size you cannot know until runtime
+// but is likely to be small, and whose lifetime can be bounded by either the stack or some
+// immovable parent object.
+//
+// SmallArray is not an Array. In particular, it has the following differences:
+//
+// 1. SmallArray has an inline buffer of `smallSize` elements, where `smallSize` is a size_t
+//    template parameter. If one is constructed with a size less than or equal to `smallSize`, the
+//    inline space is used, and no heap allocation is performed. Otherwise, a regular heap Array is
+//    allocated.
+//
+// 2. SmallArray is immovable. You must construct one in place wherever you want to use one. They
+//    cannot be "released", "finished", or assigned-to.
+//
+// 3. SmallArray has no specific constructor functions like `heapArray<T>()`. Instead, use its
+//    constructor directly, passing a single `size` parameter.
+//
+// SmallArray requires its element type T to have a default constuctor. This is because SmallArray
+// always constructs and destructs the objects in its inline space, even if it ends up falling back
+// to a heap Array. This is done for implementation simplicity, and notably matches the behavior of
+// the `KJ_STACK_ARRAY` macro, which has the same use case as SmallArray.
+//
+// TODO(someday): Implement SmallArrayBuilder to support types which have no default constructor.
+
+template <typename T, size_t smallSize>
+class SmallArray final: private Array<T> {
+public:
+  explicit SmallArray(size_t size);
+
+  // We support the full Array<T> API except `releaseAsBytes()`, `releaseAsChars()`, `attach()`,
+  // `operator=()`, and move-construction.
+
+  KJ_DISALLOW_COPY_AND_MOVE(SmallArray);
+
+  using Array<T>::operator ArrayPtr<T>;
+  using Array<T>::operator ArrayPtr<const T>;
+  using Array<T>::asPtr;
+  using Array<T>::size;
+  using Array<T>::operator[];
+  using Array<T>::begin;
+  using Array<T>::end;
+  using Array<T>::front;
+  using Array<T>::back;
+  using Array<T>::operator==;
+  using Array<T>::slice;
+  using Array<T>::first;
+  using Array<T>::asBytes;
+  using Array<T>::asChars;
+  using Array<T>::as;
+
+private:
+  T space[smallSize];
+};
+
+// =======================================================================================
 // KJ_MAP
 
 #define KJ_MAP(elementName, array) \
@@ -693,6 +752,12 @@ void ArrayDisposer::dispose(T* firstElement, size_t elementCount, size_t capacit
                          sizeof(T), elementCount, capacity, &Dispose_<T>::destruct);
   }
 }
+
+template <typename T, size_t smallSize>
+SmallArray<T, smallSize>::SmallArray(size_t size)
+    : Array<T>(size <= smallSize
+        ? Array<T>(space, size, NullArrayDisposer::instance)
+        : heapArray<T>(size)) {}
 
 namespace _ {  // private
 
