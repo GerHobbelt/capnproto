@@ -360,6 +360,7 @@ static kj::Maybe<kj::OneOf<HttpMethod, HttpConnectMethod>> consumeHttpMethod(cha
 
   switch (*p++) {
     case 'A': EXPECT_REST(A,CL)
+    case 'B': EXPECT_REST(B,AN)
     case 'C':
       switch (*p++) {
         case 'H': EXPECT_REST(CH,ECKOUT)
@@ -431,7 +432,7 @@ static kj::Maybe<kj::OneOf<HttpMethod, HttpConnectMethod>> consumeHttpMethod(cha
         case 'S': EXPECT_REST(UNS,UBSCRIBE)
         default: return kj::none;
       }
-    
+
     default: return kj::none;
   }
 #undef EXPECT_REST
@@ -499,8 +500,8 @@ static void requireValidHeaderName(kj::StringPtr name) {
   }
 }
 
-static void requireValidHeaderValue(kj::StringPtr value) {
-  KJ_REQUIRE(HttpHeaders::isValidHeaderValue(value), "invalid header value",
+static void requireValidHeaderValue(kj::StringPtr value, auto name) {
+  KJ_REQUIRE(HttpHeaders::isValidHeaderValue(value), name, "invalid header value",
       kj::encodeCEscape(value));
 }
 
@@ -696,31 +697,44 @@ bool HttpHeaders::isWebSocket() const {
 }
 
 void HttpHeaders::set(HttpHeaderId id, kj::StringPtr value) {
+  // TODO(cleanup): Remove this soon.
+  setPtr(id, value);
+}
+
+void HttpHeaders::setPtr(HttpHeaderId id, kj::StringPtr value) {
   id.requireFrom(*table);
-  requireValidHeaderValue(value);
+  requireValidHeaderValue(value, id);
 
   indexedHeaders[id.id] = value;
 }
 
 void HttpHeaders::set(HttpHeaderId id, kj::String&& value) {
-  set(id, kj::StringPtr(value));
+  setPtr(id, kj::StringPtr(value));
   takeOwnership(kj::mv(value));
 }
 
-void HttpHeaders::add(kj::StringPtr name, kj::StringPtr value) {
+void HttpHeaders::addPtrPtr(kj::StringPtr name, kj::StringPtr value) {
   requireValidHeaderName(name);
-  requireValidHeaderValue(value);
+  requireValidHeaderValue(value, name);
 
   addNoCheck(name, value);
 }
 
-void HttpHeaders::add(kj::StringPtr name, kj::String&& value) {
-  add(name, kj::StringPtr(value));
+void HttpHeaders::add(kj::StringPtr name, kj::StringPtr value) {
+  addPtrPtr(name, value);
+}
+
+void HttpHeaders::addPtr(kj::StringPtr name, kj::String&& value) {
+  addPtrPtr(name, kj::StringPtr(value));
   takeOwnership(kj::mv(value));
 }
 
+void HttpHeaders::add(kj::StringPtr name, kj::String&& value) {
+  addPtr(name, kj::mv(value));
+}
+
 void HttpHeaders::add(kj::String&& name, kj::String&& value) {
-  add(kj::StringPtr(name), kj::StringPtr(value));
+  addPtrPtr(kj::StringPtr(name), kj::StringPtr(value));
   takeOwnership(kj::mv(name));
   takeOwnership(kj::mv(value));
 }
@@ -2181,6 +2195,18 @@ kj::Own<kj::AsyncInputStream> HttpInputStreamImpl::getEntityBody(
     if (fastCaseCmp<'c','h','u','n','k','e','d'>(te.cStr())) {
       // #3¶1
       return kj::heap<HttpChunkedEntityReader>(*this);
+    } else if (fastCaseCmp<'c','h','u','n','k','e','d',',',
+                      ' ','c','h','u','n','k','e','d'>(te.cStr()) ||
+               fastCaseCmp<'c','h','u','n','k','e','d',',',
+                      'c','h','u','n','k','e','d'>(te.cStr())) {
+      // Handle "chunked, chunked" (with or without space) as equivalent to "chunked"
+      // This is technically invalid per HTTP spec, but we treat it as single chunked encoding
+      // to avoid breaking compatibility with misconfigured clients/proxies
+      // Note that this does not create a risk for request smuggling because, in the worst case,
+      // if the sender actually did double-chunk the stream, we'll merely end up delivering a
+      // corrupted stream (the body will contain chunk framing).
+      // We would not end up misinterpreting the outer framing, so we won't desync.
+      return kj::heap<HttpChunkedEntityReader>(*this);
     } else if (fastCaseCmp<'i','d','e','n','t','i','t','y'>(te.cStr())) {
       // #3¶2
       KJ_REQUIRE(type != REQUEST, "request body cannot have Transfer-Encoding other than chunked");
@@ -2887,7 +2913,7 @@ public:
               // We must reset context on each message.
               decompressor.reset();
             }
-            
+
             auto decompressedOrError = decompressor.processMessage(message, originalMaxSize);
             KJ_SWITCH_ONEOF(decompressedOrError) {
               KJ_CASE_ONEOF(protocolError, ProtocolError) {
@@ -3541,7 +3567,7 @@ private:
           // We must reset context on each message.
           compressor.reset();
         }
-        
+
         KJ_SWITCH_ONEOF(compressor.processMessage(message)) {
           KJ_CASE_ONEOF(error, ProtocolError) {
             KJ_FAIL_REQUIRE("Error compressing websocket message: ", error.description);
@@ -6295,7 +6321,7 @@ public:
     auto parsed = Url::parse(url, Url::HTTP_PROXY_REQUEST, urlOptions);
     auto path = parsed.toString(Url::HTTP_REQUEST);
     auto headersCopy = headers.clone();
-    headersCopy.set(HttpHeaderId::HOST, parsed.host);
+    headersCopy.setPtr(HttpHeaderId::HOST, parsed.host);
     return getClient(parsed).request(method, path, headersCopy, expectedBodySize);
   }
 
@@ -6311,7 +6337,7 @@ public:
     auto parsed = Url::parse(url, Url::HTTP_PROXY_REQUEST, urlOptions);
     auto path = parsed.toString(Url::HTTP_REQUEST);
     auto headersCopy = headers.clone();
-    headersCopy.set(HttpHeaderId::HOST, parsed.host);
+    headersCopy.setPtr(HttpHeaderId::HOST, parsed.host);
     return getClient(parsed).openWebSocket(path, headersCopy);
   }
 
@@ -6736,7 +6762,7 @@ public:
     // `Upgrade: websocket` so that headers.isWebSocket() returns true on the service side.
     auto urlCopy = kj::str(url);
     auto headersCopy = kj::heap(headers.clone());
-    headersCopy->set(HttpHeaderId::UPGRADE, "websocket");
+    headersCopy->setPtr(HttpHeaderId::UPGRADE, "websocket");
     KJ_DASSERT(headersCopy->isWebSocket());
 
     auto paf = kj::newPromiseAndFulfiller<WebSocketResponse>();
@@ -8274,7 +8300,7 @@ kj::Promise<void> HttpServerErrorHandler::handleClientProtocolError(
 
   HttpHeaderTable headerTable {};
   HttpHeaders headers(headerTable);
-  headers.set(HttpHeaderId::CONTENT_TYPE, "text/plain");
+  headers.setPtr(HttpHeaderId::CONTENT_TYPE, "text/plain");
 
   auto errorMessage = kj::str("ERROR: ", protocolError.description);
   auto body = response.send(protocolError.statusCode, protocolError.statusMessage,
@@ -8303,7 +8329,7 @@ kj::Promise<void> HttpServerErrorHandler::handleApplicationError(
 
     HttpHeaderTable headerTable {};
     HttpHeaders headers(headerTable);
-    headers.set(HttpHeaderId::CONTENT_TYPE, "text/plain");
+    headers.setPtr(HttpHeaderId::CONTENT_TYPE, "text/plain");
 
     kj::String errorMessage;
     kj::Own<AsyncOutputStream> body;
@@ -8337,7 +8363,7 @@ void HttpServerErrorHandler::handleListenLoopException(kj::Exception&& exception
 kj::Promise<void> HttpServerErrorHandler::handleNoResponse(kj::HttpService::Response& response) {
   HttpHeaderTable headerTable {};
   HttpHeaders headers(headerTable);
-  headers.set(HttpHeaderId::CONTENT_TYPE, "text/plain");
+  headers.setPtr(HttpHeaderId::CONTENT_TYPE, "text/plain");
 
   constexpr auto errorMessage = "ERROR: The HttpService did not generate a response."_kj;
   auto body = response.send(500, "Internal Server Error", headers, errorMessage.size());

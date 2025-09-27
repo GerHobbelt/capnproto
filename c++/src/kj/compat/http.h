@@ -80,8 +80,12 @@ namespace kj {
   MACRO(NOTIFY) \
   MACRO(SUBSCRIBE) \
   MACRO(UNSUBSCRIBE) \
-  MACRO(QUERY)
-  /* UPnP */
+  /* UPnP */ \
+  \
+  MACRO(QUERY) \
+  /* https://www.ietf.org/archive/id/draft-ietf-httpbis-safe-method-w-body-05.html */ \
+  MACRO(BAN) \
+  /* Non-standard method name requested by a Cloudflare customer. */
 
 enum class HttpMethod {
   // Enum of known HTTP methods.
@@ -204,7 +208,7 @@ class HttpHeaderTable {
   //
   //     // Get http://example.com.
   //     HttpHeaders headers(table);
-  //     headers.set(accept, "text/html");
+  //     headers.setPtr(accept, "text/html");
   //     auto response = client->send(kj::HttpMethod::GET, "http://example.com", headers)
   //         .wait(waitScope);
   //     auto msg = kj::str("Response content type: ", response.headers.get(contentType));
@@ -330,7 +334,11 @@ public:
   // `func2(name, value)` for each header that does not. All calls to func1() precede all calls to
   // func2().
 
+  KJ_DEPRECATED("Use setPtr()")
   void set(HttpHeaderId id, kj::StringPtr value);
+  void setPtr(HttpHeaderId id, kj::StringPtr value);
+  void setPtr(HttpHeaderId id, kj::String&& value) = delete;
+
   void set(HttpHeaderId id, kj::String&& value);
   // Sets a header value, overwriting the existing value.
   //
@@ -340,8 +348,18 @@ public:
   //   HttpHeaders object is destroyed. This allows string literals to be passed without making a
   //   copy, but complicates the use of dynamic values. Hint: Consider using `takeOwnership()`.
 
+  KJ_DEPRECATED("Use addPtrPtr()")
   void add(kj::StringPtr name, kj::StringPtr value);
+  void addPtrPtr(kj::StringPtr name, kj::StringPtr value);
+  void addPtrPtr(kj::StringPtr name, kj::String&& value) = delete;
+  void addPtrPtr(kj::String&& name, kj::StringPtr value) = delete;
+  void addPtrPtr(kj::String&& name, kj::String&& value) = delete;
+
+  KJ_DEPRECATED("Use addPtr()")
   void add(kj::StringPtr name, kj::String&& value);
+  void addPtr(kj::StringPtr name, kj::String&& value);
+  void addPtr(kj::String&& name, kj::String&& value) = delete;
+
   void add(kj::String&& name, kj::String&& value);
   // Append a header. `name` will be looked up in the header table, but if it's not mapped, the
   // header will be added to the list of unmapped headers.

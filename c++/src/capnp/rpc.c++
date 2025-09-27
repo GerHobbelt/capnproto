@@ -493,6 +493,11 @@ public:
     // all future calls on this connection.
     networkException.addTraceHere();
 
+    // Retain details from the original exception.
+    for (auto& detail : exception.getDetails()) {
+      networkException.setDetail(detail.id, kj::heapArray<kj::byte>(detail.value));
+    }
+
     // Set our connection state to Disconnected now so that no one tries to write any messages to
     // it in their destructors.
     auto& rpcSystem = connection.get<Connected>().rpcSystem;
@@ -3850,7 +3855,12 @@ private:
               contextRef.sendErrorReturn(kj::mv(exception));
             }).eagerlyEvaluate([&](kj::Exception&& exception) {
               // Handle exceptions that occur in sendReturn()/sendErrorReturn().
-              taskFailed(kj::mv(exception));
+              // We add this as a task since we can't call taskFailed here.
+              // If we did, we'd destroy this promise as part of disconnecting
+              // while it's executing, which would abort the process.
+              // By adding the exception as a task we can defer tearing down the
+              // connection to another turn of the event loop.
+              tasks.add(kj::mv(exception));
             });
       }
     }
