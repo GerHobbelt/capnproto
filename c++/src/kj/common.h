@@ -81,11 +81,8 @@ KJ_BEGIN_HEADER
                "system has libc++ installed (as should be the case on e.g. Mac OSX), try adding "\
                "-stdlib=libc++ to your CXXFLAGS."
     #endif
-  #else
-    #error "This library does not currently support GCC due to https://gcc.gnu.org/bugzilla/show_bug.cgi?id=102051."
-    // #if __GNUC__ < 10
-    //   #warning "This library requires at least GCC 10.0."
-    // #endif
+  #elif (__GNUC__ < 14) || (__GNUC__ == 14 && __GNUC_MINOR__ < 3)
+    #warning "This library requires at least GCC 14.3 due to https://gcc.gnu.org/bugzilla/show_bug.cgi?id=102051."
   #endif
 #elif defined(_MSC_VER)
   #if _MSC_VER < 1930 && !defined(__clang__)
@@ -645,7 +642,7 @@ constexpr bool canMemcpy() {
   // Returns true if T can be copied using memcpy instead of using the copy constructor or
   // assignment operator.
 
-  return __is_trivially_constructible(T, const T&) && __is_trivially_assignable(T, const T&);
+  return __is_trivially_constructible(T, const T&) && __is_trivially_assignable(T&, const T&);
 }
 #define KJ_ASSERT_CAN_MEMCPY(T) \
   static_assert(kj::canMemcpy<T>(), "this code expects this type to be memcpy()-able");
@@ -1026,24 +1023,27 @@ private:
 
 // We want placement new, but we don't want to #include <new>.  operator new cannot be defined in
 // a namespace, and defining it globally conflicts with the definition in <new>.  So we have to
-// define a dummy type and an operator new that uses it.
+// define a dummy type and an operator new that uses it.  The dummy type is intentionally passed
+// as the last parameter so clang and GCC ABI calling conventions for empty struct struct parameters
+// are compatible, and there are not segfaults trying to call clang operator new/delete from GCC or
+// vice versa.
 
 namespace _ {  // private
 struct PlacementNew {};
 }  // namespace _ (private)
 } // namespace kj
 
-inline void* operator new(size_t, kj::_::PlacementNew, void* __p) noexcept {
+inline void* operator new(size_t, void* __p, kj::_::PlacementNew) noexcept {
   return __p;
 }
 
-inline void operator delete(void*, kj::_::PlacementNew, void* __p) noexcept {}
+inline void operator delete(void*, void* __p, kj::_::PlacementNew) noexcept {}
 
 namespace kj {
 
 template <typename T, typename... Params>
 inline void ctor(T& location, Params&&... params) {
-  new (_::PlacementNew(), &location) T(kj::fwd<Params>(params)...);
+  new (&location, _::PlacementNew()) T(kj::fwd<Params>(params)...);
 }
 
 template <typename T>
@@ -1907,11 +1907,13 @@ public:
   constexpr ArrayPtr<PropagateConst<T, byte>> asBytes() const {
     // Reinterpret the array as a byte array. This is explicitly legal under C++ aliasing
     // rules.
+    KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
     return { reinterpret_cast<PropagateConst<T, byte>*>(ptr), size_ * sizeof(T) };
   }
   inline ArrayPtr<PropagateConst<T, char>> asChars() const {
     // Reinterpret the array as a char array. This is explicitly legal under C++ aliasing
     // rules.
+    KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
     return { reinterpret_cast<PropagateConst<T, char>*>(ptr), size_ * sizeof(T) };
   }
 

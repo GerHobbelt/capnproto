@@ -559,13 +559,18 @@ public:
       kj::Vector<kj::Own<ClientHook>> clientsToRelease;
       kj::Vector<decltype(Answer::task)> tasksToRelease;
       kj::Vector<kj::Promise<void>> resolveOpsToRelease;
-      KJ_DEFER(tasks.clear());
-
       kj::Vector<kj::Own<QuestionRef>> questionsToReject;
+
       KJ_DEFER({
         for (auto& questionRef: questionsToReject) {
-          questionRef->reject(kj::cp(networkException));
+          KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
+            questionRef->reject(kj::cp(networkException));
+          })) {
+            KJ_LOG(ERROR, exception);
+          }
         }
+
+        tasks.clear();
       });
 
       // All current questions complete with exceptions.
@@ -1402,10 +1407,6 @@ private:
 
     WriteDescriptorResult writeDescriptor(rpc::CapDescriptor::Builder descriptor,
                                           kj::Vector<int>& fds) override {
-      // TODO(now): Setting receivedCall = true seems wrong here, writing a descriptor does not
-      //   imply that the capability is being called, and so does not imply that an embargo is
-      //   needed when the capability is resolved.
-      receivedCall = true;
       return connectionState->writeDescriptor(*cap, descriptor, fds);
     }
 
@@ -3690,11 +3691,15 @@ private:
         builder.setReleaseParamCaps(false);
         builder.setResultsSentElsewhere();
 
-        // TODO(now): We have no idea if the response contains capabilities, so we can't use
-        //   `noFinishNeeded` as aggressively as usual, but we could probably still use it as
-        //   long as `hints.noPromisePipelining` is true. In that case we can assume no pipelined
-        //   calls and also assume no disembargo, since an embargo would only be needed after
-        //   pipelined calls.
+        if (hints.noPromisePipelining) {
+          // Since we expect no pipelined calls, we also expect no embargoes, so there's no need
+          // to wait for a Finish message before cleaning up the answer table.
+          builder.setNoFinishNeeded(true);
+
+          // Tell ourselves that a finish was already received, so that `cleanupAnswerTable()`
+          // removes the answer table entry.
+          receivedFinish = true;
+        }
 
         message->send();
 
@@ -3860,7 +3865,7 @@ private:
               builder.setAnswerId(answerId);
               builder.setReleaseParamCaps(false);
 
-              // TODO(now): Consider if, in the case that `conn` and `otherConn` are actually the
+              // TODO(perf): Consider if, in the case that `conn` and `otherConn` are actually the
               //   same, we can actually use `takeFromOtherQuestion` here in order to more rapidly
               //   cut this spur off of the path, speeding up the later disembargo...
               builder.setResultsSentElsewhere();
@@ -3943,7 +3948,7 @@ private:
         // Copy the response.
         // TODO(perf):  It would be nice if we could somehow make the response get built in-place
         //   but requires some refactoring.
-        // TODO(now): Actually this seems important to fix. We don't want a local tail call in the
+        // TODO(soon): Actually this seems important to fix. We don't want a local tail call in the
         //   chain to break three-party forwarding. Can we just pass the same CallContext to the
         //   new call?
         getResults(tailResponse.targetSize()).set(tailResponse);
@@ -4159,7 +4164,7 @@ private:
         }
 
         if (answerIsInitialized) {
-          // HACK: Move the answer task to the local TaskSet, becaues it's no cancelable by a
+          // HACK: Move the answer task to the local TaskSet, because it's no cancelable by a
           //   Finish message. It should be completing promptly anyway, since a tail call has
           //   occurred.
           connectionState->tasks.add(
