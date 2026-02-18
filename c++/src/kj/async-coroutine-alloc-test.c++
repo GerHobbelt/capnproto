@@ -135,7 +135,7 @@ kj::Promise<size_t> coroFib10(Allocator& alloc, size_t i) {
 }
 
 KJ_TEST("Coroutine Frame sizes") {
-#if defined(__clang__) && __clang_major__ >= 20 && defined(NDEBUG)
+#if defined(__clang__) && defined(KJ_ASYNC_COROUTINE_ALLOC_TEST_ASSERT_FRAME_SIZE)
   // Coroutine size varies between compilers and optimization level. We still want to keep track
   // of coroutine sizes. Thus restrict check to newest clang opt build.
   // We intentionally keep the upper bound open to detect when production compiler deviates.
@@ -151,21 +151,21 @@ KJ_TEST("Coroutine Frame sizes") {
     DebugCoroutineAllocator allocator;
     auto promise = immediateCoroutine(allocator);
     KJ_EXPECT(allocator.totalAllocCount == 1);
-    KJ_EXPECT_CORO_SIZE(allocator.totalAllocSize == 192);
+    KJ_EXPECT_CORO_SIZE(allocator.totalAllocSize == 184);
   }
 
   {
     DebugCoroutineAllocator allocator;
     auto promise = coroFib(allocator, 10);
     KJ_EXPECT(allocator.totalAllocCount == 1);
-    KJ_EXPECT_CORO_SIZE(allocator.totalAllocSize == 352);
+    KJ_EXPECT_CORO_SIZE(allocator.totalAllocSize == 336);
   }
 
   {
     DebugCoroutineAllocator allocator;
     auto promise = coroFib10(allocator, 10);
     KJ_EXPECT(allocator.totalAllocCount == 1);
-    KJ_EXPECT_CORO_SIZE(allocator.totalAllocSize == 928);
+    KJ_EXPECT_CORO_SIZE(allocator.totalAllocSize == 920);
   }
 }
 

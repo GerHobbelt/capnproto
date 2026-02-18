@@ -937,9 +937,7 @@ void XThreadEvent::ensureDoneOrCanceled() {
         lock->executing.remove(*this);
         lock->cancel.add(*this);
         state = CANCELING;
-        KJ_IF_SOME(p, loop->port) {
-          p.wake();
-        }
+        loop->wake();
 
         Maybe<Executor&> maybeSelfExecutor = kj::none;
         if (threadLocalEventLoop != nullptr) {
@@ -1077,9 +1075,7 @@ void XThreadEvent::sendReply() noexcept {
     // EventLoop, and when it tries to destroy this promise, it will wait for `state` to become
     // `DONE`, which we don't set until later on. That's nice because wake() probably makes a
     // syscall and we'd rather not hold the lock through syscalls.
-    KJ_IF_SOME(p, replyLoop->port) {
-      p.wake();
-    }
+    replyLoop->wake();
   }
 }
 
@@ -1242,11 +1238,9 @@ XThreadPaf::FulfillScope::~FulfillScope() noexcept(false) {
     lock->fulfilled.add(*obj);
     __atomic_store_n(&obj->state, FULFILLED, __ATOMIC_RELEASE);
     KJ_IF_SOME(l, lock->loop) {
-      KJ_IF_SOME(p, l.port) {
-        // TODO(perf): It's annoying we have to call wake() with the lock held, but we have to
-        //   prevent the destination EventLoop from being destroyed first.
-        p.wake();
-      }
+      // TODO(perf): It's annoying we have to call wake() with the lock held, but we have to
+      //   prevent the destination EventLoop from being destroyed first.
+      l.wake();
     } else {
       // The thread which called kj::newPromiseAndCrossThreadFulfiller<T>() apparently exited its
       // own event loop without canceling the cross-thread promise first. Whoever now owns the
@@ -1318,11 +1312,9 @@ void Executor::send(_::XThreadEvent& event, bool sync) const {
   event.state = _::XThreadEvent::QUEUED;
   lock->start.add(event);
 
-  KJ_IF_SOME(p, loop->port) {
-    p.wake();
-  } else {
-    // Event loop will be waiting on executor.wait(), which will be woken when we unlock the mutex.
-  }
+  loop->wake();
+
+  // Event loop will be waiting on executor.wait(), which will be woken when we unlock the mutex.
 
   if (sync) {
     lock.wait([&](auto&) { return event.state == _::XThreadEvent::DONE; });
@@ -1758,11 +1750,12 @@ void EventPort::wake() const {
       "cross-thread wake() not implemented by this EventPort implementation"));
 }
 
-EventLoop::EventLoop()
-    : daemons(kj::heap<TaskSet>(_::LoggingErrorHandler::instance)) {}
+EventLoop::EventLoop(kj::Maybe<EventLoopObserver&> observer)
+    : observer(observer), daemons(kj::heap<TaskSet>(_::LoggingErrorHandler::instance)) {}
 
-EventLoop::EventLoop(EventPort& port)
+EventLoop::EventLoop(EventPort& port, kj::Maybe<EventLoopObserver&> observer)
     : port(port),
+      observer(observer),
       daemons(kj::heap<TaskSet>(_::LoggingErrorHandler::instance)) {}
 
 EventLoop::~EventLoop() noexcept(false) {
@@ -1892,6 +1885,20 @@ void EventLoop::wait() {
     return;
   }
 
+  KJ_IF_SOME(observer, this->observer) {
+    observer.onWaitStart();
+  }
+
+  KJ_SILENCE_DANGLING_ELSE_BEGIN
+  // For some reason silence inside KJ_IF_SOME doesn't work.
+  // Putting this silence inside KJ_DEFER doesn't help either.
+  KJ_DEFER({
+    KJ_IF_SOME(observer, this->observer) {
+      observer.onWaitEnd();
+    }
+  });
+  KJ_SILENCE_DANGLING_ELSE_END
+
   KJ_IF_SOME(p, port) {
     if (p.wait()) {
       // Another thread called wake(). Check for cross-thread events.
@@ -1923,6 +1930,12 @@ void EventLoop::poll() {
     _::Event* event = wouldSleepHead;
     event->disarm();
     event->armDepthFirst();
+  }
+}
+
+void EventLoop::wake() const {
+  KJ_IF_SOME(p, port) {
+    p.wake();
   }
 }
 
@@ -2412,6 +2425,10 @@ void PromiseNode::OnReadyEvent::armBreadthFirst() {
   }
 
   event = _kJ_ALREADY_READY;
+}
+
+bool PromiseNode::OnReadyEvent::armed() const {
+  return event == _kJ_ALREADY_READY;
 }
 
 // -------------------------------------------------------------------
@@ -3188,26 +3205,14 @@ void CoroutineBase::unhandledExceptionImpl(ExceptionOrValue& resultRef) {
     if (disposalResults.exception == kj::none) {
       disposalResults.exception = kj::mv(exception);
     }
-  } else if (isWaiting()) {
-    // Exception during coroutine execution.
-    resultRef.addException(kj::mv(exception));
-    scheduleResumption();
   } else {
-    // Okay, what could this mean? We've already been fulfilled or rejected, but we aren't being
-    // destroyed yet. The only possibility is that we are unwinding the coroutine frame due to a
-    // successful completion, and something in the frame threw. We can't already be rejected,
-    // because rejecting a coroutine involves throwing, which would have unwound the frame prior
-    // to setting `waiting = false`.
-    //
-    // Since we know we're unwinding due to a successful completion, we also know that whatever
-    // Event we may have armed has not yet fired, because we haven't had a chance to return to
-    // the event loop.
-
-    KJ_IASSERT(!isDone());
-
-    // Since final_suspend() hasn't been called, whatever Event is waiting on us has not fired,
-    // and will see this exception.
     resultRef.addException(kj::mv(exception));
+    if (!onReadyEvent.armed()) {
+      // Exception during coroutine execution.
+      onReadyEvent.arm();
+    }
+    // Otherwise this is an exception during during coroutine frame-unwind
+    // in-between co_return and final_suspend().
   }
 }
 
@@ -3283,7 +3288,7 @@ void CoroutineBase::destroy() {
 
   KJ_IF_SOME(exception, disposalResults.exception) {
     if (UnwindDetector::uncaughtExceptionCount() == 0) {
-      // Technically this does not equal the `UnwindDetector` logic, 
+      // Technically this does not equal the `UnwindDetector` logic,
       // but this behaviour will never lead to trouble, is almost always true on practice
       // (only coroutines _created_ during unwind could notice a difference in behaviour),
       // and, more importantly, much faster.
