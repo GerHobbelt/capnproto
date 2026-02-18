@@ -148,12 +148,6 @@ public:
   Maybe<T> tryParseAs() const;
   // Same as parseAs, but rather than throwing an exception we return NULL.
 
-  template <typename... Attachments>
-  ConstString attach(Attachments&&... attachments) const KJ_WARN_UNUSED_RESULT;
-  ConstString attach() const KJ_WARN_UNUSED_RESULT;
-  // Like ArrayPtr<T>::attach(), but instead promotes a StringPtr into a ConstString. Generally the
-  // attachment should be an object that somehow owns the String that the StringPtr is pointing at.
-
   template <typename T>
   inline auto as() { return asImpl((T*)nullptr, *this); }
   // Syntax sugar for invoking asImpl(T*, StringPtr&).
@@ -356,6 +350,9 @@ public:
   inline Array<const char> releaseArray() { return kj::mv(content); }
   // Disowns the backing array (which includes the NUL terminator) and returns it. The ConstString value
   // is clobbered (as if moved away).
+
+  inline ConstString clone() const;
+  // Clones the string, avoiding heap allocation if it is based on a string literal.
 
   inline constexpr const char* cStr() const KJ_LIFETIMEBOUND;
 
@@ -733,16 +730,6 @@ inline LiteralStringConst::operator ConstString() const {
   return ConstString(begin(), size(), NullArrayDisposer::instance);
 }
 
-inline ConstString StringPtr::attach() const {
-  // This is meant as a roundabout way to make a ConstString from a StringPtr
-  return ConstString(begin(), size(), NullArrayDisposer::instance);
-}
-
-template <typename... Attachments>
-inline ConstString StringPtr::attach(Attachments&&... attachments) const {
-  return ConstString { content.attach(kj::fwd<Attachments>(attachments)...) };
-}
-
 inline constexpr String::operator ArrayPtr<char>() {
   return content == nullptr ? ArrayPtr<char>(nullptr) : content.first(content.size() - 1);
 }
@@ -787,6 +774,15 @@ inline String::String(char* value, size_t size, const ArrayDisposer& disposer)
 inline ConstString::ConstString(const char* value, size_t size, const ArrayDisposer& disposer)
     : content(value, size + 1, disposer) {
   KJ_IREQUIRE(value[size] == '\0', "String must be NUL-terminated.");
+}
+
+inline ConstString ConstString::clone() const {
+  // NullArrayDisposer indicates strings constructed via LiteralStringConst
+  if (content.hasNullDisposer()) {
+    return ConstString(Array(content.begin(), content.size(), NullArrayDisposer::instance));
+  } else {
+    return ConstString(heapArray<char>(content));
+  }
 }
 
 inline String::String(Array<char> buffer): content(kj::mv(buffer)) {

@@ -853,6 +853,19 @@ private:
     }
   }
 
+  bool allTablesEmpty() {
+    // Returns true if all of the tables (imports, questions, etc.) are empty.
+    //
+    // More specifically, if this returns true, then calling disconnect() would not disrupt
+    // anything, because there's nothing to disrupt. This is important to decide if the connection
+    // is idle.
+
+    return questions.empty() && answers.empty() && exports.empty() && imports.empty() &&
+        // Technically the embargoes table should always be empty if the others are, but it's not
+        // expensive to check it.
+        embargoes.empty();
+  }
+
   void checkIfBecameIdle() {
     // Checks if the connection has become idle, and if so, informs the VatNetwork by calling
     // setIdle(true). Generally, this must be called after erasing an entry from any of the
@@ -860,13 +873,7 @@ private:
 
     if (idle) return;  // already idle
 
-    bool allTablesEmpty =
-        questions.empty() && answers.empty() && exports.empty() && imports.empty() &&
-        // Technically the embargoes table should always be empty if the others are, but it's not
-        // expensive to check it.
-        embargoes.empty();
-
-    if (!allTablesEmpty) {
+    if (!allTablesEmpty()) {
       // Not idle, don't do anything.
       return;
     }
@@ -3104,9 +3111,11 @@ private:
       if (isFirstResponder()) {
         // We haven't sent a return yet, so we must have been canceled.  Send a cancellation return.
         unwindDetector.catchExceptionsIfUnwinding([&]() {
+          bool shouldFreePipeline = true;
+          KJ_DEFER(cleanupAnswerTable(nullptr, shouldFreePipeline));
+
           // Don't send anything if the connection is broken, or if the onlyPromisePipeline hint
           // was used (in which case the caller doesn't care to receive a `Return`).
-          bool shouldFreePipeline = true;
           if (connectionState->connection.is<Connected>() && !hints.onlyPromisePipeline) {
             auto message = connectionState->connection.get<Connected>().connection
                 ->newOutgoingMessage(messageSizeHint<rpc::Return>() + sizeInWords<rpc::Payload>());
@@ -3134,8 +3143,6 @@ private:
 
             message->send();
           }
-
-          cleanupAnswerTable(nullptr, shouldFreePipeline);
         });
       }
     }
@@ -3157,6 +3164,17 @@ private:
       // Avoid sending results if canceled so that we don't have to figure out whether or not
       // `releaseResultCaps` was set in the already-received `Finish`.
       if (!receivedFinish && isFirstResponder()) {
+        kj::Maybe<kj::Array<ExportId>> exports;
+        KJ_DEFER({
+          KJ_IF_SOME(e, exports) {
+            // Caps were returned, so we can't free the pipeline yet.
+            cleanupAnswerTable(kj::mv(e), false);
+          } else {
+            // No caps in the results, therefore the pipeline is irrelevant.
+            cleanupAnswerTable(nullptr, true);
+          }
+        });
+
         KJ_ASSERT(connectionState->connection.is<Connected>(),
                   "Cancellation should have been requested on disconnect.") {
           return;
@@ -3183,7 +3201,6 @@ private:
           selfPromise.detach([](kj::Exception&&) {});
         }
 
-        kj::Maybe<kj::Array<ExportId>> exports;
         KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
           // Debug info in case send() fails due to overside message.
           KJ_CONTEXT("returning from RPC call", interfaceId, methodId);
@@ -3203,20 +3220,16 @@ private:
                 kj::mv(inner), responseImpl, kj::addRef(*this));
           });
         }
-
-        KJ_IF_SOME(e, exports) {
-          // Caps were returned, so we can't free the pipeline yet.
-          cleanupAnswerTable(kj::mv(e), false);
-        } else {
-          // No caps in the results, therefore the pipeline is irrelevant.
-          cleanupAnswerTable(nullptr, true);
-        }
       }
     }
     void sendErrorReturn(kj::Exception&& exception) {
       KJ_ASSERT(!redirectResults);
       KJ_ASSERT(!hints.onlyPromisePipeline);
       if (isFirstResponder()) {
+        // Do not allow releasing the pipeline because we want pipelined calls to propagate the
+        // exception rather than fail with a "no such field" exception.
+        KJ_DEFER(cleanupAnswerTable(nullptr, false));
+
         if (connectionState->connection.is<Connected>()) {
           auto message = connectionState->connection.get<Connected>().connection
               ->newOutgoingMessage(messageSizeHint<rpc::Return>() + exceptionSizeHint(exception));
@@ -3234,10 +3247,6 @@ private:
 
           message->send();
         }
-
-        // Do not allow releasing the pipeline because we want pipelined calls to propagate the
-        // exception rather than fail with a "no such field" exception.
-        cleanupAnswerTable(nullptr, false);
       }
     }
     void sendRedirectReturn() {
@@ -3245,6 +3254,8 @@ private:
       KJ_ASSERT(!hints.onlyPromisePipeline);
 
       if (isFirstResponder()) {
+        KJ_DEFER(cleanupAnswerTable(nullptr, false));
+
         auto message = connectionState->connection.get<Connected>().connection
             ->newOutgoingMessage(messageSizeHint<rpc::Return>());
         auto builder = message->getBody().initAs<rpc::Message>().initReturn();
@@ -3258,8 +3269,6 @@ private:
         //   don't want to fully think through the implications right now.
 
         message->send();
-
-        cleanupAnswerTable(nullptr, false);
       }
     }
 
@@ -3327,6 +3336,10 @@ private:
 
           KJ_IF_SOME(tailInfo, rpcRequest.tailSend()) {
             if (isFirstResponder()) {
+              // There are no caps in our return message, but of course the tail results could have
+              // caps, so we must continue to honor pipeline calls (and just bounce them back).
+              KJ_DEFER(cleanupAnswerTable(nullptr, false));
+
               if (connectionState->connection.is<Connected>()) {
                 auto message = connectionState->connection.get<Connected>().connection
                     ->newOutgoingMessage(messageSizeHint<rpc::Return>());
@@ -3338,10 +3351,6 @@ private:
 
                 message->send();
               }
-
-              // There are no caps in our return message, but of course the tail results could have
-              // caps, so we must continue to honor pipeline calls (and just bounce them back).
-              cleanupAnswerTable(nullptr, false);
             }
             return { kj::mv(tailInfo.promise), kj::mv(tailInfo.pipeline) };
           }
@@ -3426,6 +3435,10 @@ private:
       // We need to remove the `callContext` pointer -- which points back to us -- from the
       // answer table.  Or we might even be responsible for removing the entire answer table
       // entry.
+      //
+      // NOTE: Whoever calls `isFirstResponder()` first (and receives a true return value) MUST
+      //   call `cleanUpAnswerTable()` to avoid dangling pointers. If nobody else calls
+      //   `isFirstResponder()` then the destructor will do it.
 
       if (receivedFinish) {
         // Already received `Finish` so it's our job to erase the table entry. We shouldn't have
@@ -3507,22 +3520,18 @@ private:
             co_return;
           }
 
-          // At this point, the last reference to this connection state *should* be the one in
-          // the RpcSystem's map. The refcount should therefore be 1, and `isShared()`.
-          if (isShared()) {
-            // Oh, we still have references. We will need to set ourselves to the "disconnected"
-            // state.
-            // TODO(bug): Previously, I had a KJ_LOG(ERROR) here, and it did actually show up in
-            //   production, but I couldn't tell what was holding the reference. Hopefully,
-            //   propagating an explicit exception here will give us a stack trace that tells us
-            //   what's holding onto the connection.
-            tasks.add(KJ_EXCEPTION(FAILED,
-                "RpcSystem bug: Connection shut down due to being idle, but if you're seeing "
-                "this error then apparently something was still using the connection. Please "
-                "take note of the stack and fix checkIfBecameIdle() to account for this kind of "
-                "reference still existing."));
-            co_return;
-          }
+          // We shouldn't have become idle if the tables aren't empty. Double-check.
+          //
+          // Note that if any table is non-empty, then we need to call `disconnect()`, which
+          // iterates through all the tables and rejects the appropriate promises to propagate
+          // the error. But if the tables are empty, then we can skip disconnect() and just
+          // set the state to `Disconnected` below, which saves time and avoids spurious logging,
+          // hence why we're performing this check.
+          KJ_ASSERT(allTablesEmpty(),
+              // If the assert fails, let's log all the tables to try to figure out which is the
+              // culprit...
+              questions.empty(), answers.empty(), exports.empty(), imports.empty(),
+              embargoes.empty());
 
           // Make sure to mark ourselves as Disconnected so if the shutdown task fails it doesn't
           // cause us to call shutdown() again.

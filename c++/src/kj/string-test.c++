@@ -383,52 +383,20 @@ KJ_TEST("ConstString literal operator") {
   KJ_EXPECT(theString == "it's a const string!");
 }
 
-KJ_TEST("ConstString promotion") {
-  kj::StringPtr theString = "it's a const string!";
-  kj::ConstString constString = theString.attach();
-  KJ_EXPECT(constString == "it's a const string!");
-}
+KJ_TEST("ConstString clone") {
+  // Clone from string literal – cloned string points to same location
+  kj::ConstString literalConst = "foo"_kjc;
+  kj::ConstString literalClone = literalConst.clone();
+  KJ_EXPECT(literalClone == "foo");
+  KJ_EXPECT(literalConst.cStr() == literalClone.cStr());
 
-struct DestructionOrderRecorder {
-  DestructionOrderRecorder(uint& counter, uint& recordTo)
-    : counter(counter), recordTo(recordTo) {}
-  ~DestructionOrderRecorder() {
-    recordTo = ++counter;
-  }
-
-  uint& counter;
-  uint& recordTo;
-};
-
-KJ_TEST("ConstString attachment lifetimes") {
-  uint counter = 0;
-  uint destroyed1 = 0;
-  uint destroyed2 = 0;
-  uint destroyed3 = 0;
-
-  auto obj1 = kj::heap<DestructionOrderRecorder>(counter, destroyed1);
-  auto obj2 = kj::heap<DestructionOrderRecorder>(counter, destroyed2);
-  auto obj3 = kj::heap<DestructionOrderRecorder>(counter, destroyed3);
-
-  StringPtr theString = "it's a string!";
-  const char* ptr = theString.begin();
-
-  ConstString combined = theString.attach(kj::mv(obj1), kj::mv(obj2), kj::mv(obj3));
-
-  KJ_EXPECT(combined.begin() == ptr);
-
-  KJ_EXPECT(obj1.get() == nullptr);
-  KJ_EXPECT(obj2.get() == nullptr);
-  KJ_EXPECT(obj3.get() == nullptr);
-  KJ_EXPECT(destroyed1 == 0);
-  KJ_EXPECT(destroyed2 == 0);
-  KJ_EXPECT(destroyed3 == 0);
-
-  combined = nullptr;
-
-  KJ_EXPECT(destroyed1 == 1, destroyed1);
-  KJ_EXPECT(destroyed2 == 2, destroyed2);
-  KJ_EXPECT(destroyed3 == 3, destroyed3);
+  // Clone from heap string – strings point to different locations
+  kj::ConstString heapConst = kj::ConstString(kj::str("bar"));
+  kj::ConstString heapClone = heapConst.clone();
+  KJ_EXPECT(heapConst.cStr() != heapClone.cStr());
+  // still valid after original string gets deallocated
+  heapConst = nullptr;
+  KJ_EXPECT(heapClone == "bar");
 }
 
 KJ_TEST("StringPtr find") {
