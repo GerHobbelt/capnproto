@@ -2456,7 +2456,7 @@ void AttachmentPromiseNodeBase::get(ExceptionOrValue& output) noexcept {
 void AttachmentPromiseNodeBase::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
   dependency->tracePromise(builder, stopAtNextEvent);
 
-  // TODO(debug): Maybe use __builtin_return_address to get the locations that called fork() and
+  // TODO(debug): Maybe use KJ_CALLING_ADDRESS() to get the locations that called fork() and
   //   addBranch()?
 }
 
@@ -2558,7 +2558,7 @@ void ForkBranchBase::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
     hub->inner->tracePromise(builder, false);
   }
 
-  // TODO(debug): Maybe use __builtin_return_address to get the locations that called fork() and
+  // TODO(debug): Maybe use KJ_CALLING_ADDRESS() to get the locations that called fork() and
   //   addBranch()?
 }
 
@@ -2743,7 +2743,7 @@ void ExclusiveJoinPromiseNode::get(ExceptionOrValue& output) noexcept {
 }
 
 void ExclusiveJoinPromiseNode::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
-  // TODO(debug): Maybe use __builtin_return_address to get the locations that called
+  // TODO(debug): Maybe use KJ_CALLING_ADDRESS() to get the locations that called
   //   exclusiveJoin()?
 
   if (stopAtNextEvent) return;
@@ -2846,7 +2846,7 @@ void ArrayJoinPromiseNodeBase::get(ExceptionOrValue& output) noexcept {
 }
 
 void ArrayJoinPromiseNodeBase::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
-  // TODO(debug): Maybe use __builtin_return_address to get the locations that called
+  // TODO(debug): Maybe use KJ_CALLING_ADDRESS() to get the locations that called
   //   joinPromises()?
 
   if (stopAtNextEvent) return;
@@ -3087,7 +3087,7 @@ void EagerPromiseNodeBase::onReady(Event* event) noexcept {
 }
 
 void EagerPromiseNodeBase::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
-  // TODO(debug): Maybe use __builtin_return_address to get the locations that called
+  // TODO(debug): Maybe use KJ_CALLING_ADDRESS() to get the locations that called
   //   eagerlyEvaluate()? But note that if a non-null exception handler was passed to it, that
   //   creates a TransformPromiseNode which will report the location anyhow.
 
@@ -3163,16 +3163,14 @@ Promise<void> IdentityFunc<Promise<void>>::operator()() const { return READY_NOW
 
 namespace _ {  // (private)
 
-CoroutineBase::CoroutineBase(stdcoro::coroutine_handle<> coroutine, ExceptionOrValue& resultRef,
-                             SourceLocation location)
+CoroutineBase::CoroutineBase(stdcoro::coroutine_handle<> coroutine, SourceLocation location)
     : Event(location),
-      coroutine(coroutine),
-      resultRef(resultRef) {}
+      coroutine(coroutine) {}
 CoroutineBase::~CoroutineBase() noexcept(false) {
   readMaybe(maybeDisposalResults)->destructorRan = true;
 }
 
-void CoroutineBase::unhandled_exception() {
+void CoroutineBase::unhandledExceptionImpl(ExceptionOrValue& resultRef) {
   // Pretty self-explanatory, we propagate the exception to the promise which owns us, unless
   // we're being destroyed, in which case we propagate it back to our disposer. Note that all
   // unhandled exceptions end up here, not just ones after the first co_await.
@@ -3180,7 +3178,13 @@ void CoroutineBase::unhandled_exception() {
   auto exception = getCaughtExceptionAsKj();
 
   KJ_IF_SOME(disposalResults, maybeDisposalResults) {
-    // Exception during coroutine destruction. Only record the first one.
+    // Exception during coroutine destruction.
+    if (!isDone()) {
+      // do not report destructor exception during cancellation.
+      return;
+    }
+
+    // Record only the first one.
     if (disposalResults.exception == kj::none) {
       disposalResults.exception = kj::mv(exception);
     }
@@ -3199,13 +3203,7 @@ void CoroutineBase::unhandled_exception() {
     // Event we may have armed has not yet fired, because we haven't had a chance to return to
     // the event loop.
 
-    // final_suspend() has not been called.
-#if _MSC_VER && !defined(__clang__)
-    // See comment at `finalSuspendCalled`'s definition.
-    KJ_IASSERT(!finalSuspendCalled);
-#else
-    KJ_IASSERT(!coroutine.done());
-#endif
+    KJ_IASSERT(!isDone());
 
     // Since final_suspend() hasn't been called, whatever Event is waiting on us has not fired,
     // and will see this exception.
@@ -3269,9 +3267,6 @@ void CoroutineBase::destroy() {
   DisposalResults disposalResults;
   maybeDisposalResults = &disposalResults;
 
-  // Need to save this while `unwindDetector` is still valid.
-  bool shouldRethrow = !unwindDetector.isUnwinding();
-
   do {
     // Clang's implementation of Coroutines does not destroy the Coroutine object or deallocate the
     // coroutine frame if a destructor of an object on the frame threw an exception. This is despite
@@ -3287,7 +3282,11 @@ void CoroutineBase::destroy() {
   // WARNING: `this` is now a dangling pointer.
 
   KJ_IF_SOME(exception, disposalResults.exception) {
-    if (shouldRethrow) {
+    if (UnwindDetector::uncaughtExceptionCount() == 0) {
+      // Technically this does not equal the `UnwindDetector` logic, 
+      // but this behaviour will never lead to trouble, is almost always true on practice
+      // (only coroutines _created_ during unwind could notice a difference in behaviour),
+      // and, more importantly, much faster.
       kj::throwFatalException(kj::mv(exception));
     } else {
       // An exception is already unwinding the stack, so throwing this secondary exception would
@@ -3299,16 +3298,22 @@ void CoroutineBase::destroy() {
 PromiseAwaiterBase::PromiseAwaiterBase(OwnPromiseNode&& node): node(kj::mv(node)) {}
 PromiseAwaiterBase::PromiseAwaiterBase(PromiseAwaiterBase&&) = default;
 PromiseAwaiterBase::~PromiseAwaiterBase() noexcept(false) {
-  // Make sure it's safe to generate an async stack trace between now and when the Coroutine is
-  // destroyed.
-  KJ_IF_SOME(coroutine, maybeCoroutine) {
-    coroutine.clearPromiseNodeForTrace();
-  }
+  if (node.get() != nullptr) {
+    // Cancellation of a suspended awaiter.
+    // We must have a coroutine attached otherwise we wouldn't be suspended.
+    auto& coroutine = KJ_REQUIRE_NONNULL(maybeCoroutine);
 
-  unwindDetector.catchExceptionsIfUnwinding([this]() {
-    // No need to check for a moved-from state, node will just ignore the nullification.
-    node = nullptr;
-  });
+    // Make sure it's safe to generate an async stack trace between now and when the Coroutine is
+    // destroyed.
+    coroutine.clearPromiseNodeForTrace();
+
+    try {
+      node = nullptr;
+    } catch (...) {
+      // Ignore exceptions that happen during co_await cancellation: most likely it happens in the
+      // error path already, and there is not much for the user to do if cancellation fails.
+    }
+  }
 }
 
 void PromiseAwaiterBase::awaitResumeImpl(ExceptionOrValue& result, void* awaitedAt) {
@@ -3318,11 +3323,15 @@ void PromiseAwaiterBase::awaitResumeImpl(ExceptionOrValue& result, void* awaited
 
   node->get(result);
 
+  try {
+    node = nullptr;
+  } catch (...) {
+    result.addException(getCaughtExceptionAsKj());
+  }
+
   KJ_IF_SOME(exception, result.exception) {
     // Manually extend the stack trace with the instruction address where the co_await occurred.
-    // Subtract 1 from the address to be consistent with `getStackTrace()` in `exception.c++` (see
-    // comment there).
-    exception.addTrace(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(awaitedAt) - 1));
+    exception.addTrace(awaitedAt);
 
     // Pass kj::maxValue for ignoreCount here so that `throwFatalException()` doesn't try to
     // extend the stack trace. There's no point in extending the trace beyond the single frame we

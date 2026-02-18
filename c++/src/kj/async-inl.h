@@ -1573,9 +1573,9 @@ inline PromiseForResult<Func, void> evalLast(Func&& func) {
 template <typename Func>
 inline PromiseForResult<Func, void> evalNow(Func&& func) {
   PromiseForResult<Func, void> result = nullptr;
-  KJ_IF_SOME(e, kj::runCatchingExceptions([&]() {
+  KJ_TRY {
     result = func();
-  })) {
+  } KJ_CATCH(e) {
     result = kj::mv(e);
   }
   return result;
@@ -1783,21 +1783,23 @@ private:
 template <typename T>
 template <typename Func>
 bool PromiseFulfiller<T>::rejectIfThrows(Func&& func) {
-  KJ_IF_SOME(exception, kj::runCatchingExceptions(kj::mv(func))) {
+  KJ_TRY {
+    func();
+    return true;
+  } KJ_CATCH(exception) {
     reject(kj::mv(exception));
     return false;
-  } else {
-    return true;
   }
 }
 
 template <typename Func>
 bool PromiseFulfiller<void>::rejectIfThrows(Func&& func) {
-  KJ_IF_SOME(exception, kj::runCatchingExceptions(kj::mv(func))) {
+  KJ_TRY {
+    func();
+    return true;
+  } KJ_CATCH(exception) {
     reject(kj::mv(exception));
     return false;
-  } else {
-    return true;
   }
 }
 
@@ -2210,13 +2212,105 @@ PromiseCrossThreadFulfillerPair<T> Executor::newPromiseAndCrossThreadFulfiller()
 
 namespace kj::_ {
 
-template <typename T> class Coroutine;
+template <typename T, typename Allocator> class Coroutine;
 
 template <typename T>
 concept NoWaitScope = !isSameType<Decay<T>, WaitScope>();
 // Define a Concept to use in our `coroutine_traits` specialization to validate allowable coroutine
 // parameter types.
 // TODO(cleanup): This can be removed by adding KJ_DISALLOW_AS_COROUTINE_PARAM to WaitScope.
+
+struct DefaultCoroutineAllocator;
+
+class CoroutineAllocator {
+  // Marker class for all coroutine allocators.
+  // Custom allocators need to publicly extend `CoroutineAllocator` and implement following methods:
+  // - `void* alloc(std::size_t frameSize)`
+  // - `static void free(void* framePtr, std::size_t frameSize)`
+  // - `static void free(void* framePtr)` - this is needed for older compilers only (slower).
+  //
+  // Notice that allocator instance is not available in `free()` - the allocator needs to recover it
+  // itself if necessary.
+  //
+  // To use custom allocator, pass a reference to it to the coroutine function as any parameter.
+  // Keep passing the allocator reference around if you want to keep using the allocator for
+  // inner coroutines.
+  // If allocator parameter is not present, then `DefaultCoroutineAllocator` is used.
+
+private:
+  // Implementations of public meta-programming api.
+
+  template <typename X>
+  requires (!kj::canConvert<X, CoroutineAllocator>())
+  static constexpr std::nullptr_t tryGetAllocator(X&&) { return nullptr; }
+
+  template <typename X>
+  requires (kj::canConvert<X, CoroutineAllocator>())
+  static constexpr X* tryGetAllocator(X& alloc) { return &alloc; }
+
+  template <typename... Args>
+  struct AllocatorTypeHelper {
+    using Type = DefaultCoroutineAllocator;
+  };
+
+  template <typename First, typename... Rest>
+  struct AllocatorTypeHelper<First, Rest...>:
+      AllocatorTypeHelper<Rest...> {};
+
+  template <typename First, typename... Rest>
+  requires (kj::canConvert<First, CoroutineAllocator>())
+  struct AllocatorTypeHelper<First, Rest...> {
+    using Type = Decay<First>;
+  };
+
+public:
+  // Meta-programming api to detect and extract allocator arguments.
+
+  template <typename... Args>
+  static constexpr bool hasAllocator = (kj::canConvert<Args, CoroutineAllocator &>() || ...);
+  // Check if any of the argument is an allocator reference.
+
+  template <typename... Args>
+  using AllocatorType = typename AllocatorTypeHelper<Args...>::Type;
+  // Extract exact allocator type, returns `DefaultCoroutineAllocator` if no allocator argument
+  // is present.
+
+  template <typename First, typename... Rest>
+  static constexpr auto& getAllocator(First&& first, Rest&&... rest) {
+    // Extract allocator argument, assumes `hasAllocator` is true.
+
+    if constexpr (kj::canConvert<First, CoroutineAllocator>()) {
+      return first;
+    } else {
+      static_assert(sizeof...(Rest) > 0, "No allocator found in arguments");
+      return getAllocator(kj::fwd<Rest>(rest)...);
+    }
+  }
+
+};
+
+struct DefaultCoroutineAllocator: public CoroutineAllocator {
+  // Default coroutine allocator.
+  // Used when now allocator parameter is specified in coroutine declaration.
+  // Can be instantiated and passed as a reference as well.
+
+  inline static void* alloc(std::size_t frameSize) {
+    // Note: new[]/delete[] are measurably slower.
+    return ::operator new(frameSize);
+  }
+
+  inline static void free(void* framePtr, std::size_t frameSize) {
+#if defined(__cpp_sized_deallocation)
+    ::operator delete(framePtr, frameSize);
+#else
+    ::operator delete(framePtr);
+#endif
+  }
+
+  inline static void free(void* framePtr) {
+    ::operator delete(framePtr);
+  }
+};
 
 }  // namespace kj::_
 
@@ -2242,7 +2336,7 @@ struct coroutine_traits<kj::Promise<T>, Args...> {
   // A second note: This has the reasonable side effect of making it impossible for us to write
   // WaitScope member coroutines.
 
-  using promise_type = kj::_::Coroutine<T>;
+  using promise_type = kj::_::Coroutine<T, kj::_::CoroutineAllocator::AllocatorType<Args...>>;
   // The C++ standard calls this the "promise type". This makes sense when thinking of coroutines
   // returning `std::future<T>`, since the coroutine implementation would be a wrapper around
   // a `std::promise<T>`. It's extremely confusing from a KJ perspective, however, so I call it
@@ -2265,15 +2359,14 @@ namespace stdcoro = KJ_COROUTINE_STD_NAMESPACE;
 class CoroutineBase: public PromiseNode,
                      public Event {
 public:
-  CoroutineBase(stdcoro::coroutine_handle<> coroutine, ExceptionOrValue& resultRef,
-                SourceLocation location);
+  CoroutineBase(stdcoro::coroutine_handle<> coroutine, SourceLocation location);
   ~CoroutineBase() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(CoroutineBase);
   void destroy() override;
 
   auto initial_suspend() { return stdcoro::suspend_never(); }
   auto final_suspend() noexcept {
-#if _MSC_VER && !defined(__clang__)
+#if !defined(__clang__)
     // See comment at `finalSuspendCalled`'s definition.
     finalSuspendCalled = true;
 #endif
@@ -2287,8 +2380,6 @@ public:
   //
   // The final suspension point is useful to delay deallocation of the coroutine frame to match the
   // lifetime of the enclosing promise.
-
-  void unhandled_exception();
 
   // Called from Awaiter implementations to integrate with async tracing during suspension.
   void setPromiseNodeForTrace(OwnPromiseNode& node) {
@@ -2313,6 +2404,8 @@ protected:
     waiting = false;
   }
 
+  void unhandledExceptionImpl(ExceptionOrValue& resultRef);
+
 private:
   // -------------------------------------------------------
   // PromiseNode implementation
@@ -2327,22 +2420,24 @@ private:
   void traceEvent(TraceBuilder& builder) override;
 
   stdcoro::coroutine_handle<> coroutine;
-  ExceptionOrValue& resultRef;
 
   OnReadyEvent onReadyEvent;
   bool waiting = true;
 
   bool hasSuspendedAtLeastOnce = false;
 
-#if _MSC_VER && !defined(__clang__)
+#if !defined(__clang__)
   bool finalSuspendCalled = false;
-  // MSVC erroneously reports the coroutine as done (that is, `coroutine.done()` returns true)
+  // MSVC and GCC erroneously report the coroutine as done (that is, `coroutine.done()` returns true)
   // seemingly as soon as `return_value()`/`return_void()` are called. This matters in our
   // implementation of `unhandled_exception()`, which must arrange to propagate exceptions during
   // coroutine frame unwind via the returned promise, even if `return_value()`/`return_void()` have
   // already been called. To prove that our assumptions are correct in that function, we want to be
   // able to assert that `final_suspend()` has not yet been called. This boolean hack allows us to
   // preserve that assertion.
+  inline bool isDone() const { return finalSuspendCalled; }
+#else
+  inline bool isDone() const { return coroutine.done(); }
 #endif
 
   Maybe<OwnPromiseNode&> promiseNodeForTrace;
@@ -2350,8 +2445,6 @@ private:
   // promise so tracePromise()/traceEvent() can trace into it. Since ChainPromiseNodes have the
   // ability to destroy themselves, replacing their own Own, we hold a reference to the owning Own
   // instead of directly to the PromiseNode.
-
-  UnwindDetector unwindDetector;
 
   struct DisposalResults {
     bool destructorRan = false;
@@ -2368,25 +2461,24 @@ template <typename Self, typename T>
 class CoroutineMixin;
 // CRTP mixin, covered later.
 
-template <typename T>
+template <typename T, typename Allocator>
 class Coroutine final: public CoroutineBase,
-                       public CoroutineMixin<Coroutine<T>, T> {
+                       public CoroutineMixin<Coroutine<T, Allocator>, T> {
   // The standard calls this the `promise_type` object. We can call this the "coroutine
   // implementation object" since the word promise means different things in KJ and std styles. This
   // is where we implement how a `kj::Promise<T>` is returned from a coroutine, and how that promise
   // is later fulfilled. We also fill in a few lifetime-related details.
   //
-  // The implementation object is also where we can customize memory allocation of coroutine frames,
-  // by implementing a member `operator new(size_t, Args...)` (same `Args...` as in
-  // coroutine_traits).
+  // The type is statically parametrized by an `Allocator` to enable custom coroutine allocators
+  // without any overhead. See `CoroutineAllocator` for more details.
 
 public:
-  using Handle = stdcoro::coroutine_handle<Coroutine<T>>;
+  using Handle = stdcoro::coroutine_handle<Coroutine<T, Allocator>>;
 
   Coroutine(SourceLocation location = {}): Coroutine(Handle::from_promise(*this), location) {}
 
   Coroutine(stdcoro::coroutine_handle<> handle, SourceLocation location = {})
-      : CoroutineBase(handle, result, location) {}
+      : CoroutineBase(handle, location) {}
 
   Promise<T> get_return_object() {
     // Called after coroutine frame construction and before initial_suspend() to create the
@@ -2432,6 +2524,31 @@ public:
       scheduleResumption();
     }
   }
+
+  void unhandled_exception() { unhandledExceptionImpl(result); }
+
+
+  template <typename... Args>
+  inline void* operator new(std::size_t frameSize, Args&&... args) {
+    if constexpr (CoroutineAllocator::hasAllocator<Args...>) {
+      return CoroutineAllocator::getAllocator(args...).alloc(frameSize);
+    } else {
+      return Allocator::alloc(frameSize);
+    }
+  }
+
+
+#if defined(__cpp_sized_deallocation)
+  inline void operator delete(void* framePtr, size_t frameSize) {
+    // Deallocates coroutine frame.
+    Allocator::free(framePtr, frameSize);
+  }
+#else
+  inline void operator delete(void* framePtr) {
+    // Deallocates coroutine frame.
+    Allocator::free(framePtr);
+  }
+#endif
 
 private:
   // -------------------------------------------------------
@@ -2483,7 +2600,6 @@ protected:
   bool awaitSuspendImpl(CoroutineBase& coroutine);
 
 private:
-  UnwindDetector unwindDetector;
   OwnPromiseNode node;
 
   Maybe<CoroutineBase&> maybeCoroutine;
@@ -2506,18 +2622,12 @@ public:
   explicit PromiseAwaiter(OwnPromiseNode&& node): PromiseAwaiterBase(kj::mv(node)) {}
 
   KJ_NOINLINE T await_resume() {
-    // This is marked noinline in order to ensure __builtin_return_address() is accurate for stack
+    // This is marked noinline in order to ensure KJ_CALLING_ADDRESS() is accurate for stack
     // trace purposes. In my experimentation, this method was not inlined anyway even in opt
     // builds, but I want to make sure it doesn't suddenly start being inlined later causing stack
     // traces to break. (I also tried always-inline, but this did not appear to cause the compiler
     // to inline the method -- perhaps a limitation of coroutines?)
-#if __GNUC__
-    awaitResumeImpl(result, __builtin_return_address(0));
-#elif _MSC_VER
-    awaitResumeImpl(result, _ReturnAddress());
-#else
-    #error "please implement for your compiler"
-#endif
+    awaitResumeImpl(result, KJ_CALLING_ADDRESS());
     auto value = kj::_::readMaybe(result.value);
     KJ_IASSERT(value != nullptr, "Neither exception nor value present.");
     return T(kj::mv(*value));
