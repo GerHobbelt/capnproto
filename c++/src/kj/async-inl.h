@@ -143,87 +143,6 @@ struct alignas(void*) PromiseArena {
   byte bytes[1024];
 };
 
-class Event: private AsyncObject {
-  // An event waiting to be executed.  Not for direct use by applications -- promises use this
-  // internally.
-
-public:
-  Event(SourceLocation location);
-  Event(kj::EventLoop& loop, SourceLocation location);
-  ~Event() noexcept;
-  KJ_DISALLOW_COPY_AND_MOVE(Event);
-
-  void armDepthFirst();
-  // Enqueue this event so that `fire()` will be called from the event loop soon.
-  //
-  // Events scheduled in this way are executed in depth-first order:  if an event callback arms
-  // more events, those events are placed at the front of the queue (in the order in which they
-  // were armed), so that they run immediately after the first event's callback returns.
-  //
-  // Depth-first event scheduling is appropriate for events that represent simple continuations
-  // of a previous event that should be globbed together for performance.  Depth-first scheduling
-  // can lead to starvation, so any long-running task must occasionally yield with
-  // `armBreadthFirst()`.  (Promise::then() uses depth-first whereas evalLater() uses
-  // breadth-first.)
-  //
-  // To use breadth-first scheduling instead, use `armBreadthFirst()`.
-
-  void armBreadthFirst();
-  // Like `armDepthFirst()` except that the event is placed at the end of the queue.
-
-  void armLast();
-  // Enqueues this event to happen after all other events have run to completion and there is
-  // really nothing left to do except wait for I/O.
-
-  void armWhenWouldSleep();
-  // Enqueues this event to a separate queue of events which should be promoted
-
-  bool isNext();
-  // True if the Event has been armed and is next in line to be fired. This can be used after
-  // calling PromiseNode::onReady(event) to determine if a promise being waited is immediately
-  // ready, in which case continuations may be optimistically run without returning to the event
-  // loop. Note that this optimization is only valid if we know that we would otherwise immediately
-  // return to the event loop without running more application code. So this turns out to be useful
-  // in fairly narrow circumstances, chiefly when a coroutine is about to suspend, but discovers it
-  // doesn't need to.
-  //
-  // Returns false if the event loop is not currently running. This ensures that promise
-  // continuations don't execute except under a call to .wait().
-
-  void disarm() noexcept;
-  // If the event is armed but hasn't fired, cancel it. (Destroying the event does this
-  // implicitly.)
-
-  virtual void traceEvent(TraceBuilder& builder) = 0;
-  // Build a trace of the callers leading up to this event. `builder` will be populated with
-  // "return addresses" of the promise chain waiting on this event. The return addresses may
-  // actually be the addresses of lambdas passed to .then(), but in any case, feeding them into
-  // addr2line should produce useful source code locations.
-  //
-  // `traceEvent()` may be called from an async signal handler while `fire()` is executing. It
-  // must not allocate nor take locks.
-
-  String traceEvent();
-  // Helper that builds a trace and stringifies it.
-
-protected:
-  virtual Maybe<Own<Event>> fire() = 0;
-  // Fire the event.  Possibly returns a pointer to itself, which will be discarded by the
-  // caller.  This is the only way that an event can delete itself as a result of firing, as
-  // doing so from within fire() will throw an exception.
-
-private:
-  friend class kj::EventLoop;
-  EventLoop& loop;
-  Event* next;
-  Event** prev;
-  bool firing = false;
-
-  static constexpr uint MAGIC_LIVE_VALUE = 0x1e366381u;
-  uint live = MAGIC_LIVE_VALUE;
-  SourceLocation location;
-};
-
 class PromiseArenaMember {
   // An object that is allocated in a PromiseArena. `PromiseNode` inherits this, and most
   // arena-allocated objects are `PromiseNode` subclasses, but `TaskSet::Task`, ForkHub, and
@@ -2356,7 +2275,7 @@ struct coroutine_traits<kj::Promise<T>, Args...> {
 
 namespace kj::_ {
 
-namespace stdcoro = KJ_COROUTINE_STD_NAMESPACE;
+namespace stdcoro = ::KJ_COROUTINE_STD_NAMESPACE;
 
 class CoroutineBase: public PromiseNode,
                      public Event {
@@ -2458,6 +2377,11 @@ template <typename Self, typename T>
 class CoroutineMixin;
 // CRTP mixin, covered later.
 
+template <typename T>
+class PromiseAwaiter;
+template <typename T>
+class ForkedPromiseAwaiter;
+
 template <typename T, typename Allocator>
 class Coroutine final: public CoroutineBase,
                        public CoroutineMixin<Coroutine<T, Allocator>, T> {
@@ -2486,31 +2410,18 @@ public:
   }
 
   template <typename U>
-  U&& await_transform(U&& awaitable) {
-    // Our `await_transform()` implementation is where we can instrument awaitables, or provide
-    // custom awaiter implementations, if we need to. Historically, this _is_ where we created
-    // awaiter implementations (that is, the classes with `await_ready()`, `await_suspend()`, and
-    // `await_resume()` member functions), because this was the only place we knew the enclosing
-    // `Coroutine<T>` type. Nowadays, `await_suspend()` can be a template, allowing us to infer
-    // the enclosing coroutine type that way.
-    //
-    // We cannot get rid of `await_transform()`, because downstream projects can (and do) implement
-    // custom coroutine implementations which wrap this implementation, and they use
-    // `await_transform()` to pass unrecognized awaitables through to us -- and if an
-    // `await_transform()` implementation exists for one awaitable types, then the compiler requires
-    // that it exist for all awaitable types `co_await`ed from within this coroutine.
-    //
-    // So, we just pass through all awaitables unchanged for now, deferring to their
-    // `operator co_await` implementations to instantiate the awaiters.
-    //
-    // TODO(someday): We could implement an `await_transform()` overload which wraps awaitables (e.g.
-    //   Promise, ForkedPromise, and whatever else comes along in the future) in a struct containing
-    //   the awaitable plus a reference to our CoroutineBase. The awaitables' `co_await`
-    //   implementation could accept this struct and pass the CoroutineBase reference to the actual
-    //   awaiter implementation's constructor (e.g. PromiseAwaiter), which would give us access to
-    //   the coroutine in `await_ready()`. This would allow us to decide whether to apply the
-    //   immediately-ready-promise optimization earlier, before suspension.
-    return kj::fwd<U>(awaitable);
+  PromiseAwaiter<U> await_transform(Promise<U>& promise) {
+    return PromiseAwaiter<U>(*this, PromiseNode::from(kj::mv(promise)));
+  }
+
+  template <typename U>
+  PromiseAwaiter<U> await_transform(Promise<U>&& promise) {
+    return PromiseAwaiter<U>(*this, PromiseNode::from(kj::mv(promise)));
+  }
+
+  template <typename U>
+  ForkedPromiseAwaiter<U> await_transform(ForkedPromise<U>& promise) {
+    return ForkedPromiseAwaiter<U>(*this, promise);
   }
 
   void fulfill(FixVoid<T>&& value) {
@@ -2577,11 +2488,10 @@ public:
 
 class PromiseAwaiterBase {
 public:
-  explicit PromiseAwaiterBase(OwnPromiseNode&& node);
+  explicit PromiseAwaiterBase(CoroutineBase& coroutine, OwnPromiseNode&& node);
 
-  PromiseAwaiterBase(PromiseAwaiterBase&&);
   ~PromiseAwaiterBase() noexcept(false);
-  KJ_DISALLOW_COPY(PromiseAwaiterBase);
+  KJ_DISALLOW_COPY_AND_MOVE(PromiseAwaiterBase);
 
   bool await_ready() const { return false; }
   // This could return "`node->get()` is safe to call" instead, which would make suspension-less
@@ -2592,17 +2502,13 @@ public:
 
 protected:
   void awaitResumeImpl(ExceptionOrValue& result, void* awaitedAt);
-  bool awaitSuspendImpl(CoroutineBase& coroutine);
+  bool awaitSuspendImpl();
 
 private:
-  OwnPromiseNode node;
+  CoroutineBase& coroutine;
+  // Reference to the enclosing coroutine.
 
-  Maybe<CoroutineBase&> maybeCoroutine;
-  // If we do suspend waiting for our wrapped promise, we store a reference to `node` in our
-  // enclosing Coroutine for tracing purposes. To guard against any edge cases where an async stack
-  // trace is generated when a PromiseAwaiter was destroyed without Coroutine::fire() having been
-  // called, we need our own reference to the enclosing Coroutine. (I struggle to think up any such
-  // scenarios, but perhaps they could occur when destroying a suspended coroutine.)
+  OwnPromiseNode node;
 };
 
 template <typename T>
@@ -2614,7 +2520,8 @@ class PromiseAwaiter: public PromiseAwaiterBase {
   // awaited promise result.
 
 public:
-  explicit PromiseAwaiter(OwnPromiseNode&& node): PromiseAwaiterBase(kj::mv(node)) {}
+  explicit PromiseAwaiter(CoroutineBase& coroutine, OwnPromiseNode&& node)
+      : PromiseAwaiterBase(coroutine, kj::mv(node)) {}
 
   KJ_NOINLINE T await_resume() {
     // This is marked noinline in order to ensure KJ_CALLING_ADDRESS() is accurate for stack
@@ -2628,9 +2535,8 @@ public:
     return T(kj::mv(*value));
   }
 
-  template <typename U> requires (canConvert<U&, CoroutineBase&>())
-  bool await_suspend(stdcoro::coroutine_handle<U> handle) {
-    return awaitSuspendImpl(handle.promise());
+  bool await_suspend(stdcoro::coroutine_handle<> handle) {
+    return awaitSuspendImpl();
   }
 
 private:
@@ -2642,8 +2548,8 @@ private:
 template <typename T>
 class ForkedPromiseAwaiter {
 public:
-  ForkedPromiseAwaiter(ForkedPromise<T>& promise)
-      : node(promise), awaiter(OwnPromiseNode(&node)) { }
+  ForkedPromiseAwaiter(CoroutineBase& coroutine, ForkedPromise<T>& promise)
+      : node(promise), awaiter(coroutine, OwnPromiseNode(&node)) { }
 
   template <typename U>
   inline bool await_suspend(stdcoro::coroutine_handle<U> coroutine) {
@@ -2660,41 +2566,6 @@ private:
 };
 
 }  // namespace kj::_
-
-namespace kj {
-
-// `operator co_await` definitions for Promise and ForkedPromise
-// ---------------------------------------------------------
-//
-// These operators are called when someone writes `co_await promise`, where `promise` is a
-// kj::Promise<T>. We return an Awaiter<T>, which implements coroutine suspension and resumption in
-// terms of the KJ async event system.
-//
-// `operator co_await` is only one of two hooks we could implement to make Promises awaitable: the
-// other one is the `await_transform()` member function on `kj::_::Coroutine<U>`. We do implement
-// that function, but all it does is pass through awaitables unchanged, which are then picked up by
-// these `co_await` operators.
-//
-// We could someday change our `await_transform()` implementation to return some sort of struct of
-// both the Promise plus a reference to the enclosing Coroutine. Our `co_await` implementations
-// could then use this information to instantiate an Awaiter with immediate access to the coroutine,
-// which would facilitate simpler code.
-
-template <typename T>
-_::PromiseAwaiter<T> operator co_await(Promise<T>& promise) {
-  return _::PromiseAwaiter<T>(_::PromiseNode::from(kj::mv(promise)));
-}
-template <typename T>
-_::PromiseAwaiter<T> operator co_await(Promise<T>&& promise) {
-  return _::PromiseAwaiter<T>(_::PromiseNode::from(kj::mv(promise)));
-}
-
-template <typename T>
-_::ForkedPromiseAwaiter<T> operator co_await(ForkedPromise<T>& promise) {
-  return _::ForkedPromiseAwaiter<T>(promise);
-}
-
-}  // namespace kj
 
 namespace kj::_ {
 
