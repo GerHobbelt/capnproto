@@ -1194,29 +1194,19 @@ KJ_TEST("kj::Weak<T> basic properties") {
   KJ_EXPECT(weak2 == nullptr);
 }
 
-KJ_TEST("kj::Ptr<T> and kj::Weak<T> conversion") {
+KJ_TEST("kj::Weak<T> upgrades to kj::Ptr<T>") {
+  static_assert(!kj::canConvert<kj::Ptr<Obj>, kj::Weak<Obj>>(),
+      "Ptr<T> should not be convertible to Weak<T>");
+  static_assert(!kj::canConvert<kj::Ptr<Obj2>, kj::Weak<Obj>>(),
+      "Ptr<Derived> should not be convertible to Weak<Base>");
+
   kj::Pin<Obj> pin("a");
-
-  kj::Ptr<Obj> ptr = pin;
-  kj::Weak<Obj> weak = ptr.asWeak();
-  KJ_EXPECT(weak == pin);
-  KJ_EXPECT(weak.assertLive().name == "a"_kj);
-
-  kj::Weak<Obj> weakFromPtr = ptr;
-  KJ_EXPECT(weakFromPtr == pin);
-  KJ_EXPECT(weakFromPtr.assertLive().name == "a"_kj);
-
-  kj::Weak<Obj> weakFromTemp = pin.asPtr();
-  KJ_EXPECT(weakFromTemp == pin);
-  KJ_EXPECT(weakFromTemp.assertLive().name == "a"_kj);
+  kj::Weak<Obj> weak = pin.addWeak();
 
   KJ_IF_SOME(strong, weak) {
     static_assert(kj::isSameType<decltype(strong), kj::Ptr<Obj>&>());
     KJ_EXPECT(strong == pin);
     KJ_EXPECT(strong->name == "a"_kj);
-
-    kj::Weak<Obj> weak2 = strong.asWeak();
-    KJ_EXPECT(weak2 == pin);
   } else {
     KJ_FAIL_EXPECT("expected KJ_IF_SOME on Weak<T> to upgrade");
   }
@@ -1229,9 +1219,6 @@ KJ_TEST("kj::Ptr<T> and kj::Weak<T> conversion") {
   KJ_IF_SOME(strong, weak.upgrade()) {
     KJ_EXPECT(strong == pin);
     KJ_EXPECT(strong->name == "a"_kj);
-
-    kj::Weak<Obj> weak2 = strong.asWeak();
-    KJ_EXPECT(weak2 == pin);
   } else {
     KJ_FAIL_EXPECT("expected Weak<T> to upgrade");
   }
@@ -1406,6 +1393,7 @@ struct TargetObj: public kj::PtrTarget {
 
   kj::Ptr<TargetObj> getPtr() { return addPtrToThis(); }
   kj::Weak<TargetObj> getWeak() { return addWeakToThis(); }
+  void invalidateWeakForTest() { invalidateWeak(); }
 
   kj::String name;
 
@@ -1466,6 +1454,110 @@ KJ_TEST("kj::PtrTarget addWeakToThis") {
   } else {
     KJ_FAIL_EXPECT("expected Maybe<Weak<T>> to contain an expired pointer");
   }
+}
+
+KJ_TEST("kj::PtrTarget invalidateWeak") {
+  TargetObj obj("a");
+  auto weak = obj.getWeak();
+
+  KJ_EXPECT(weak.upgrade() != kj::none);
+  obj.invalidateWeakForTest();
+  KJ_EXPECT(weak.tryGet() == kj::none);
+  KJ_EXPECT(weak.upgrade() == kj::none);
+
+  // Invalidation is permanent, including for weak pointers created afterwards.
+  auto laterWeak = obj.getWeak();
+  KJ_EXPECT(laterWeak.tryGet() == kj::none);
+  KJ_EXPECT(laterWeak.upgrade() == kj::none);
+
+  // Repeated invalidation leaves all weak pointers expired.
+  obj.invalidateWeakForTest();
+  KJ_EXPECT(weak.upgrade() == kj::none);
+  KJ_EXPECT(laterWeak.upgrade() == kj::none);
+}
+
+KJ_TEST("kj::PtrTarget invalidated before first weak pointer") {
+  TargetObj obj("a");
+  obj.invalidateWeakForTest();
+
+  auto weak = obj.getWeak();
+  KJ_EXPECT(weak.tryGet() == kj::none);
+  KJ_EXPECT(weak.upgrade() == kj::none);
+}
+
+struct AddWeakBeforeInvalidatingInDestructor: public kj::PtrTarget {
+  AddWeakBeforeInvalidatingInDestructor(
+      kj::Weak<AddWeakBeforeInvalidatingInDestructor>& weakFromDestructor,
+      bool& upgradedBeforeInvalidation)
+      : weakFromDestructor(weakFromDestructor),
+        upgradedBeforeInvalidation(upgradedBeforeInvalidation) {}
+
+  ~AddWeakBeforeInvalidatingInDestructor() noexcept(false) {
+    weakFromDestructor = addWeakToThis();
+    upgradedBeforeInvalidation = weakFromDestructor.upgrade() != kj::none;
+  }
+
+  kj::Weak<AddWeakBeforeInvalidatingInDestructor>& weakFromDestructor;
+  bool& upgradedBeforeInvalidation;
+};
+
+KJ_TEST("kj::PtrTarget addWeakToThis works in destructor before invalidation") {
+  kj::Weak<AddWeakBeforeInvalidatingInDestructor> weakFromDestructor;
+  bool upgradedBeforeInvalidation = false;
+
+  {
+    AddWeakBeforeInvalidatingInDestructor obj(weakFromDestructor, upgradedBeforeInvalidation);
+  }
+
+  KJ_EXPECT(upgradedBeforeInvalidation);
+  KJ_EXPECT(weakFromDestructor.upgrade() == kj::none);
+}
+
+struct InvalidateWeakInDestructor: public kj::PtrTarget {
+  InvalidateWeakInDestructor(
+      kj::Weak<InvalidateWeakInDestructor>& weakFromDestructor, bool throwLater = false)
+      : weakFromDestructor(weakFromDestructor), throwLater(throwLater) {}
+
+  ~InvalidateWeakInDestructor() noexcept(false) {
+    invalidateWeak();
+    weakFromDestructor = addWeakToThis();
+    if (throwLater) {
+      throw KJ_EXCEPTION(FAILED, "exception after invalidateWeak");
+    }
+  }
+
+  kj::Weak<InvalidateWeakInDestructor> getWeak() { return addWeakToThis(); }
+
+  kj::Weak<InvalidateWeakInDestructor>& weakFromDestructor;
+  bool throwLater;
+};
+
+KJ_TEST("kj::PtrTarget invalidated in destructor") {
+  kj::Weak<InvalidateWeakInDestructor> weakBeforeDestruction;
+  kj::Weak<InvalidateWeakInDestructor> weakFromDestructor;
+
+  {
+    auto obj = kj::heap<InvalidateWeakInDestructor>(weakFromDestructor);
+    weakBeforeDestruction = obj->getWeak();
+  }
+
+  KJ_EXPECT(weakBeforeDestruction.upgrade() == kj::none);
+  KJ_EXPECT(weakFromDestructor.upgrade() == kj::none);
+}
+
+KJ_TEST("kj::PtrTarget invalidation survives later destructor exception") {
+  kj::Weak<InvalidateWeakInDestructor> weakBeforeDestruction;
+  kj::Weak<InvalidateWeakInDestructor> weakFromDestructor;
+
+  auto exception = kj::runCatchingExceptions([&]() {
+    auto obj = kj::heap<InvalidateWeakInDestructor>(weakFromDestructor, true);
+    weakBeforeDestruction = obj->getWeak();
+    obj = nullptr;
+  });
+
+  KJ_EXPECT(exception != kj::none);
+  KJ_EXPECT(weakBeforeDestruction.upgrade() == kj::none);
+  KJ_EXPECT(weakFromDestructor.upgrade() == kj::none);
 }
 
 KJ_TEST("kj::PtrTarget subtyping") {

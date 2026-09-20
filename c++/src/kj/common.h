@@ -2571,10 +2571,10 @@ class SplitIterable;
 namespace _ {  // private
 
 class ArrayPtrCounterTracker {
-  // Registers one live ArrayPtr with an optional AtomicPtrCounter. Copying or moving an ArrayPtr
-  // creates another live ArrayPtr without clearing the source, so both operations increment the
-  // counter. When counters are disabled this class is empty, and [[no_unique_address]] makes it
-  // take no space in ArrayPtr.
+  // Registers one live ArrayPtr with an optional AtomicPtrCounter. Copying an ArrayPtr creates
+  // another live ArrayPtr and increments the counter, while moving transfers the registration and
+  // clears the source. When counters are disabled this class is empty, and [[no_unique_address]]
+  // makes it take no space in ArrayPtr.
 public:
   ArrayPtrCounterTracker() = default;
 #if KJ_ASSERT_ARRAYPTR_COUNTERS
@@ -2583,7 +2583,7 @@ public:
   inline constexpr ArrayPtrCounterTracker(const ArrayPtrCounterTracker& other)
       : counter(const_cast<Maybe<AtomicPtrCounter&>&>(other.counter)) { inc(); }
   inline constexpr ArrayPtrCounterTracker(ArrayPtrCounterTracker&& other)
-      : counter(other.counter) { inc(); }
+      : counter(other.counter) { other.counter = kj::none; }
   inline constexpr ~ArrayPtrCounterTracker() { dec(); }
 
   inline constexpr ArrayPtrCounterTracker& operator=(const ArrayPtrCounterTracker& other) {
@@ -2591,7 +2591,11 @@ public:
     return *this;
   }
   inline constexpr ArrayPtrCounterTracker& operator=(ArrayPtrCounterTracker&& other) {
-    setCounter(other.counter);
+    if (this != &other) {
+      dec();
+      counter = other.counter;
+      other.counter = kj::none;
+    }
     return *this;
   }
 
@@ -2626,6 +2630,29 @@ public:
   inline constexpr ArrayPtr(T* ptr KJ_LIFETIMEBOUND, size_t size): ptr(ptr), size_(size) {}
   inline constexpr ArrayPtr(T* begin KJ_LIFETIMEBOUND, T* end KJ_LIFETIMEBOUND)
       : ptr(begin), size_(end - begin) {}
+  inline constexpr ArrayPtr(PropagateConst<T, ArrayPtr>& other)
+      : ptr(other.ptr), size_(other.size_), counterTracker(other.counterTracker) {}
+  inline constexpr ArrayPtr(ArrayPtr&& other)
+      : ptr(other.ptr), size_(other.size_), counterTracker(kj::mv(other.counterTracker)) {
+    other.ptr = nullptr;
+    other.size_ = 0;
+  }
+  inline constexpr ArrayPtr& operator=(PropagateConst<T, ArrayPtr>& other) {
+    counterTracker = other.counterTracker;
+    ptr = other.ptr;
+    size_ = other.size_;
+    return *this;
+  }
+  inline constexpr ArrayPtr& operator=(ArrayPtr&& other) {
+    if (this != &other) {
+      counterTracker = kj::mv(other.counterTracker);
+      ptr = other.ptr;
+      size_ = other.size_;
+      other.ptr = nullptr;
+      other.size_ = 0;
+    }
+    return *this;
+  }
   ArrayPtr<T>& operator=(Array<T>&&) = delete;
   ArrayPtr<T>& operator=(decltype(nullptr)) {
     counterTracker.clear();
@@ -2690,10 +2717,24 @@ public:
     static_assert(!isSameType<T, const char32_t>(), "see above");
   }
 
-  inline operator ArrayPtr<const T>() const {
+  inline operator ArrayPtr<const T>() const & {
     return ArrayPtr<const T>(ptr, size_, counterTracker);
   }
-  inline ArrayPtr<const T> asConst() const {
+  inline operator ArrayPtr<const T>() && {
+    ArrayPtr source;
+    kj::swp(source, *this);
+    return ArrayPtr<const T>(source.ptr, source.size_, source.counterTracker);
+  }
+  inline operator ArrayPtr<const T>() const && {
+    return ArrayPtr<const T>(ptr, size_, counterTracker);
+  }
+  inline ArrayPtr<const T> asConst() const & {
+    return operator ArrayPtr<const T>();
+  }
+  inline ArrayPtr<const T> asConst() && {
+    return kj::mv(*this);
+  }
+  inline ArrayPtr<const T> asConst() const && {
     return operator ArrayPtr<const T>();
   }
 
@@ -2767,16 +2808,42 @@ public:
   inline auto split(T delim) const { return _::SplitIterable<const T>(asConst(), kj::mv(delim)); }
   // Returns iterator of segments (ArrayPtr<T>)
 
-  constexpr ArrayPtr<PropagateConst<T, byte>> asBytes() const {
+  constexpr ArrayPtr<PropagateConst<T, byte>> asBytes() const & {
     // Reinterpret the array as a byte array. This is explicitly legal under C++ aliasing
     // rules.
     KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
     return ArrayPtr<PropagateConst<T, byte>>(
         reinterpret_cast<PropagateConst<T, byte>*>(ptr), size_ * sizeof(T), counterTracker);
   }
-  inline ArrayPtr<PropagateConst<T, char>> asChars() const {
+  inline ArrayPtr<PropagateConst<T, byte>> asBytes() && {
+    KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
+    ArrayPtr source;
+    kj::swp(source, *this);
+    return ArrayPtr<PropagateConst<T, byte>>(
+        reinterpret_cast<PropagateConst<T, byte>*>(source.ptr),
+        source.size_ * sizeof(T), source.counterTracker);
+  }
+  constexpr ArrayPtr<PropagateConst<T, byte>> asBytes() const && {
+    KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
+    return ArrayPtr<PropagateConst<T, byte>>(
+        reinterpret_cast<PropagateConst<T, byte>*>(ptr), size_ * sizeof(T), counterTracker);
+  }
+  inline ArrayPtr<PropagateConst<T, char>> asChars() const & {
     // Reinterpret the array as a char array. This is explicitly legal under C++ aliasing
     // rules.
+    KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
+    return ArrayPtr<PropagateConst<T, char>>(
+        reinterpret_cast<PropagateConst<T, char>*>(ptr), size_ * sizeof(T), counterTracker);
+  }
+  inline ArrayPtr<PropagateConst<T, char>> asChars() && {
+    KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
+    ArrayPtr source;
+    kj::swp(source, *this);
+    return ArrayPtr<PropagateConst<T, char>>(
+        reinterpret_cast<PropagateConst<T, char>*>(source.ptr),
+        source.size_ * sizeof(T), source.counterTracker);
+  }
+  inline ArrayPtr<PropagateConst<T, char>> asChars() const && {
     KJ_ASSERT_CAN_MEMCPY(RemoveConst<T>);
     return ArrayPtr<PropagateConst<T, char>>(
         reinterpret_cast<PropagateConst<T, char>*>(ptr), size_ * sizeof(T), counterTracker);
@@ -2847,18 +2914,26 @@ public:
   // You must include kj/array.h to call this.
 
   template <typename U>
-  inline auto as() { return asImpl((U*)nullptr, *this); }
+  inline auto as() & { return asImpl((U*)nullptr, *this); }
   // Syntax sugar for invoking asImpl(U*, ArrayPtr&).
   // Used to chain conversion calls rather than wrap with function.
 
   template <typename U>
-  inline auto as() const { return asImpl((U*)nullptr, *this); }
+  inline auto as() const & { return asImpl((U*)nullptr, *this); }
   // Syntax sugar for invoking asImpl(U*, const ArrayPtr&).
   // Used to chain conversion calls rather than wrap with function.
 
-  auto clone() requires (Cloneable<T> || Copyable<T>);
-  auto clone() const requires (Cloneable<const T> || Copyable<const T>);
-  // Deep-clone or copy into a heap-owned array.
+  template <typename U>
+  inline auto as() && { return asImpl((U*)nullptr, kj::mv(*this)); }
+
+  template <typename U>
+  inline auto as() const && { return asImpl((U*)nullptr, kj::mv(*this)); }
+
+  auto clone() & requires (Cloneable<T> || Copyable<T>);
+  auto clone() const & requires (Cloneable<const T> || Copyable<const T>);
+  auto clone() && requires (Cloneable<T> || Copyable<T>);
+  auto clone() const && requires (Cloneable<const T> || Copyable<const T>);
+  // Deep-clone or copy into a heap-owned array. The rvalue overload clears this pointer.
 
   inline void fill(T t) {
     // Fill the area by copying t over every element.

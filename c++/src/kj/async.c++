@@ -1244,6 +1244,22 @@ bool Executor::isLive() const {
   return impl->state.lockShared()->loop != kj::none;
 }
 
+bool Executor::isCurrent() const {
+  // Answer from the calling thread's side: are we the current loop's executor? This touches only
+  // the current thread's own EventLoop (whose `executor` member is only ever accessed from that
+  // thread), so no lock is needed -- unlike reading `impl->state.loop`, which the owning thread
+  // nulls at loop destruction while other threads may be asking. If the current loop has never
+  // created an executor, `this` (which exists) cannot be it. A destroyed loop is not anyone's
+  // current loop, so that case is covered too.
+  EventLoop* current = threadLocalEventLoop;
+  if (current == nullptr) return false;
+  KJ_IF_SOME(e, current->executor) {
+    return e.get() == this;
+  } else {
+    return false;
+  }
+}
+
 void Executor::send(_::XThreadEvent& event, bool sync) const {
   KJ_ASSERT(event.state == _::XThreadEvent::UNUSED);
 
@@ -1328,6 +1344,12 @@ EventLoop& Executor::getLoop() const {
 
 const Executor& getCurrentThreadExecutor() {
   return currentEventLoop().getExecutor();
+}
+
+Maybe<const Executor&> tryGetCurrentThreadExecutor() {
+  EventLoop* loop = threadLocalEventLoop;
+  if (loop == nullptr) return kj::none;
+  return loop->getExecutor();
 }
 
 // =======================================================================================
@@ -1899,6 +1921,14 @@ void EventLoop::wait() {
   KJ_SILENCE_DANGLING_ELSE_END
 
   KJ_IF_SOME(p, port) {
+    // We only get here when the queue is empty, but `lastRunnableState` may still be true: the
+    // wait loop (waitImpl) only reports the runnable -> empty transition once the whole wait is
+    // over. Report it now, so that the port sees the true state while it sleeps and so that an
+    // event armed *during* `p.wait()` -- by work the port runs while sleeping, e.g. an
+    // integrated foreign event loop -- produces a `setRunnable(true)` edge the port can act on
+    // (e.g. stop sleeping). Without this the edge is lost and the arm sits unserviced until
+    // something else wakes the port.
+    setRunnable(false);
     if (p.wait()) {
       // Another thread called wake(). Check for cross-thread events.
       KJ_IF_SOME(e, executor) {

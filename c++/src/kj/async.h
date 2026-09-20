@@ -1133,6 +1133,15 @@ public:
   //   philosophy, but right now I'm not excited about the extra template metaprogramming needed
   //   for "try" versions...
 
+  bool isCurrent() const;
+  // Returns true if this Executor belongs to the event loop currently running on this thread --
+  // i.e. this is the executor `getCurrentThreadExecutor()` would return. Never throws; a thread
+  // with no current event loop (including one whose loop has already been destroyed) returns
+  // false. Useful for code reachable from both the owning event-loop thread and foreign threads
+  // that wants to take a fast path in the former case, e.g. a `std::task::Waker`-style callback
+  // that arms an event directly when on the loop's thread and falls back to a cross-thread
+  // fulfiller otherwise.
+
   template <typename Func>
   PromiseForResult<Func, void> executeAsync(Func&& func, SourceLocation location = {}) const;
   // Call from any thread to request that the given function be executed on the executor's thread,
@@ -1220,6 +1229,11 @@ const Executor& getCurrentThreadExecutor();
 // Get the executor for the current thread's event loop. This reference can then be passed to other
 // threads.
 
+Maybe<const Executor&> tryGetCurrentThreadExecutor();
+// Like getCurrentThreadExecutor(), but returns none if the thread has no current event loop,
+// rather than throwing. Intended for code that can run on threads with no event loop at all, e.g.
+// teardown paths and foreign-runtime callbacks.
+
 // =======================================================================================
 // The EventLoop class
 
@@ -1262,6 +1276,11 @@ public:
   // transitions from empty -> runnable or runnable -> empty.  This is typically useful when
   // integrating with an external event loop; if the loop is currently runnable then you should
   // arrange to call run() on it soon.  The default implementation does nothing.
+  //
+  // `setRunnable(false)` is guaranteed to have been called before `wait()` is invoked (the queue
+  // is empty then), so if an event is armed while `wait()` is in progress -- e.g. by work the
+  // port itself runs while sleeping -- the port will observe `setRunnable(true)` and can use it
+  // to stop sleeping.
 
   virtual void wake() const;
   // Wake up the EventPort's thread from another thread.

@@ -92,7 +92,6 @@ TEST(AsyncIo, SimpleNetwork) {
   EXPECT_EQ("foo", result);
 }
 
-#if !_WIN32  // TODO(someday): Implement NetworkPeerIdentity for Win32.
 TEST(AsyncIo, SimpleNetworkAuthentication) {
   auto ioContext = setupAsyncIo();
   auto& network = ioContext.provider->getNetwork();
@@ -164,7 +163,6 @@ TEST(AsyncIo, SimpleNetworkAuthentication) {
 
   EXPECT_EQ("foo", result);
 }
-#endif
 
 #if !_WIN32 && !__CYGWIN__  // TODO(someday): Debug why this deadlocks on Cygwin.
 
@@ -957,8 +955,7 @@ TEST(AsyncIo, Timeouts) {
   EXPECT_EQ(123, promise2.wait(ioContext.waitScope));
 }
 
-#if !_WIN32  // datagrams not implemented on win32 yet
-
+#if !_WIN32
 bool isMsgTruncBroken() {
   // Detect if the kernel fails to set MSG_TRUNC on recvmsg(). This seems to be the case at least
   // when running an arm64 binary under qemu.
@@ -997,9 +994,14 @@ bool isMsgTruncBroken() {
 
   return (msg.msg_flags & MSG_TRUNC) == 0;
 }
+#endif
 
 TEST(AsyncIo, Udp) {
+#if _WIN32
+  bool msgTruncBroken = false;
+#else
   bool msgTruncBroken = isMsgTruncBroken();
+#endif
 
   auto ioContext = setupAsyncIo();
 
@@ -1041,6 +1043,17 @@ TEST(AsyncIo, Udp) {
       promise.wait(ioContext.waitScope);
       auto content = receiver->getContent();
       EXPECT_EQ("barbaz", kj::heapString(content.value.asChars()));
+      EXPECT_FALSE(content.isTruncated);
+    }
+
+    // Send multiple buffers as one datagram.
+    {
+      auto promise = receiver->receive();
+      ArrayPtr<const byte> pieces[] = { "qux"_kjb, "quux"_kjb };
+      EXPECT_EQ(7, port1->send(pieces, *addr2).wait(ioContext.waitScope));
+      promise.wait(ioContext.waitScope);
+      auto content = receiver->getContent();
+      EXPECT_EQ("quxquux", kj::heapString(content.value.asChars()));
       EXPECT_FALSE(content.isTruncated);
     }
   }
@@ -1101,7 +1114,11 @@ TEST(AsyncIo, Udp) {
     }
 
     // See what happens if there's not quite enough space for in_pktinfo.
+#if _WIN32
+    capacity.ancillary = WSA_CMSG_SPACE(sizeof(struct in_pktinfo)) - 8;
+#else
     capacity.ancillary = CMSG_SPACE(sizeof(struct in_pktinfo)) - 8;
+#endif
     recv1 = port1->makeReceiver(capacity);
 
     EXPECT_EQ(3, port2->send("bar"_kjb, *addr1).wait(ioContext.waitScope));
@@ -1135,7 +1152,11 @@ TEST(AsyncIo, Udp) {
 #pragma GCC diagnostic ignored "-Wnull-pointer-arithmetic"
 #endif
     // See what happens if there's not enough space even for the cmsghdr.
+#if _WIN32
+    capacity.ancillary = WSA_CMSG_SPACE(0) - 8;
+#else
     capacity.ancillary = CMSG_SPACE(0) - 8;
+#endif
     recv1 = port1->makeReceiver(capacity);
 
     EXPECT_EQ(3, port2->send("baz"_kjb, *addr1).wait(ioContext.waitScope));
@@ -1155,8 +1176,6 @@ TEST(AsyncIo, Udp) {
 #endif
   }
 }
-
-#endif  // !_WIN32
 
 #ifdef __linux__  // Abstract unix sockets are only supported on Linux
 

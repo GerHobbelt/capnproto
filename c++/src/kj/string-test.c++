@@ -78,6 +78,16 @@ TEST(String, Str) {
   EXPECT_EQ("foo", str(mv(ca)));
   EXPECT_EQ("foo", str(mv(v)));
   EXPECT_EQ("foo", str(mv(f)));
+
+  StringPtr ptr = "foo";
+  EXPECT_EQ("foo", str(mv(ptr)));
+  EXPECT_EQ(nullptr, ptr);
+  EXPECT_EQ(0u, ptr.size());
+
+  ptr = "bar";
+  EXPECT_EQ("foobar", str("foo", mv(ptr)));
+  EXPECT_EQ(nullptr, ptr);
+  EXPECT_EQ(0u, ptr.size());
 }
 
 TEST(String, Nullptr) {
@@ -287,6 +297,21 @@ KJ_TEST("StringPtr constructors") {
 #endif
 }
 
+KJ_TEST("moving StringPtr clears the source") {
+  StringPtr source = "foo";
+  StringPtr moved(kj::mv(source));
+
+  KJ_EXPECT(source == nullptr);
+  KJ_EXPECT(source.size() == 0);
+  KJ_EXPECT(moved == "foo");
+
+  StringPtr assigned = "bar";
+  assigned = kj::mv(moved);
+  KJ_EXPECT(moved == nullptr);
+  KJ_EXPECT(moved.size() == 0);
+  KJ_EXPECT(assigned == "foo");
+}
+
 KJ_TEST("string literals with _kj suffix") {
   static constexpr StringPtr FOO = "foo"_kj;
   KJ_EXPECT(FOO == "foo", FOO);
@@ -422,6 +447,12 @@ KJ_TEST("StringPtr clone") {
 
   KJ_EXPECT(cloned == "foo");
   KJ_EXPECT(cloned.begin() != original.begin());
+
+  kj::StringPtr movedOriginal = "bar";
+  kj::String movedClone = kj::mv(movedOriginal).clone();
+  KJ_EXPECT(movedClone == "bar");
+  KJ_EXPECT(movedOriginal == nullptr);
+  KJ_EXPECT(movedOriginal.size() == 0);
 }
 
 KJ_TEST("String clone") {
@@ -495,6 +526,12 @@ static std::string asImpl(Std*, const StringPtr& str) {
   return std::string(str.cStr());
 }
 
+static std::string asImpl(Std*, StringPtr&& str) {
+  std::string result(str.cStr());
+  str = nullptr;
+  return result;
+}
+
 inline kj::StringPtr fromImpl(Std*, const std::string& str) {
   return kj::StringPtr(str.c_str(), str.length());
 }
@@ -511,6 +548,21 @@ KJ_TEST("as<Std>") {
   StringPtr ptr = "bar"_kj;
   std::string stdPtr = ptr.as<Std>();
   KJ_EXPECT(stdPtr == "bar");
+
+  StringPtr arraySource = "array"_kj;
+  ArrayPtr<const char> array = kj::mv(arraySource).asArray();
+  KJ_EXPECT(array == "array"_kjb);
+  KJ_EXPECT(arraySource == nullptr);
+
+  StringPtr bytesSource = "bytes"_kj;
+  ArrayPtr<const byte> bytes = kj::mv(bytesSource).asBytes();
+  KJ_EXPECT(bytes == arrayPtr(reinterpret_cast<const byte*>("bytes"), 5));
+  KJ_EXPECT(bytesSource == nullptr);
+
+  StringPtr customSource = "custom"_kj;
+  std::string custom = kj::mv(customSource).as<Std>();
+  KJ_EXPECT(custom == "custom");
+  KJ_EXPECT(customSource == nullptr);
 }
 
 KJ_TEST("from<Std>") {
