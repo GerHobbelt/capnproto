@@ -505,6 +505,40 @@ static void requireValidHeaderValue(kj::StringPtr value, auto name) {
       kj::encodeCEscape(value));
 }
 
+static bool isValidRequestUrl(kj::StringPtr url) {
+  // The request-target (URL) appears in the request line as `METHOD SP request-target SP version`.
+  // It must not contain whitespace (which would introduce extra tokens into the request line) nor
+  // any control characters (in particular CR or LF, which would allow injecting additional headers
+  // or entire requests). We reject any byte <= 0x20 (this covers space, tab, CR, LF, and NUL) as
+  // well as 0x7f (DEL). Bytes >= 0x80 are permitted since some callers pass pre-encoded or
+  // non-ASCII targets; these cannot cause desync.
+  for (char c: url) {
+    if (static_cast<byte>(c) <= 0x20 || static_cast<byte>(c) == 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void requireValidRequestUrl(kj::StringPtr url) {
+  KJ_REQUIRE(isValidRequestUrl(url), "invalid request URL", kj::encodeCEscape(url));
+}
+
+static bool isValidStatusText(kj::StringPtr text) {
+  // The status text (reason-phrase) appears at the end of the response status line. It must not
+  // contain CR, LF, or NUL, which would allow injecting additional headers or corrupt the framing.
+  for (char c: text) {
+    if (c == '\0' || c == '\r' || c == '\n') {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void requireValidStatusText(kj::StringPtr text) {
+  KJ_REQUIRE(isValidStatusText(text), "invalid status text", kj::encodeCEscape(text));
+}
+
 static const char* BUILTIN_HEADER_NAMES[] = {
   // Indexed by header ID, which includes connection headers, so we include those names too.
 #define HEADER_NAME(id, name) name,
@@ -852,7 +886,39 @@ static kj::Maybe<uint> consumeNumber(char*& ptr) {
   return result;
 }
 
-static kj::StringPtr consumeLine(char*& ptr) {
+static kj::Maybe<uint64_t> consumeNumber64(const char*& ptr) {
+  // Like consumeNumber(), but accumulates into a 64-bit value and rejects (rather than silently
+  // wrapping) numbers that don't fit. Used for byte-range positions, which are compared against a
+  // 64-bit content length.
+  const char* start = skipSpace(ptr);
+  const char* p = start;
+
+  constexpr uint64_t MAX = kj::maxValue;
+
+  uint64_t result = 0;
+
+  for (;;) {
+    const char c = *p;
+    if ('0' <= c && c <= '9') {
+      uint digit = c - '0';
+      // Reject before `result * 10 + digit` would exceed a uint64. MAX / 10 and MAX % 10 are
+      // compile-time constants, so this is a couple of comparisons per digit rather than a
+      // division.
+      if (result > MAX / 10 || (result == MAX / 10 && digit > MAX % 10)) return kj::none;
+      result = result * 10 + digit;
+      ++p;
+    } else {
+      if (p == start) return kj::none;
+      ptr = p;
+      return result;
+    }
+  }
+}
+
+static kj::StringPtr consumeLine(char*& ptr, bool* sawFolding = nullptr) {
+  // If `sawFolding` is non-null, it is set to true if an obsolete "line folding" continuation was
+  // encountered. Callers that parse header fields use this to reject the message (see
+  // parseHeaders()).
   char* start = skipSpace(ptr);
   char* p = start;
 
@@ -871,6 +937,7 @@ static kj::StringPtr consumeLine(char*& ptr) {
           // a space was treated as a continuation of the previous line. The behavior should be
           // the same as if the \r\n were replaced with spaces, so let's do that here to prevent
           // confusion later.
+          if (sawFolding != nullptr) *sawFolding = true;
           *end = ' ';
           p[-1] = ' ';
           break;
@@ -889,6 +956,7 @@ static kj::StringPtr consumeLine(char*& ptr) {
           // a space was treated as a continuation of the previous line. The behavior should be
           // the same as if the \n were replaced with spaces, so let's do that here to prevent
           // confusion later.
+          if (sawFolding != nullptr) *sawFolding = true;
           *end = ' ';
           break;
         }
@@ -914,7 +982,11 @@ static kj::Maybe<kj::StringPtr> consumeHeaderName(char*& ptr) {
   while (HTTP_HEADER_NAME_CHARS.contains(*p)) ++p;
   char* end = p;
 
-  p = skipSpace(p);
+  // Note: We intentionally do NOT skip whitespace between the header name and the colon. RFC 9112
+  // section 5.1 requires that no whitespace appear there, and that a message with such whitespace
+  // be rejected with 400 (Bad Request). Historically some HTTP implementations treated the
+  // trailing whitespace as part of the header name, which -- if a message passed through both such
+  // an implementation and a lenient one -- could lead to HTTP desync / request smuggling.
 
   if (end == start || *p != ':') return kj::none;
   ++p;
@@ -1058,7 +1130,15 @@ bool HttpHeaders::tryParse(kj::ArrayPtr<char> content) {
 bool HttpHeaders::parseHeaders(char* ptr, char* end) {
   while (*ptr != '\0') {
     KJ_IF_SOME(name, consumeHeaderName(ptr)) {
-      kj::StringPtr line = consumeLine(ptr);
+      bool sawFolding = false;
+      kj::StringPtr line = consumeLine(ptr, &sawFolding);
+      if (sawFolding) {
+        // Obsolete line folding (a continuation line beginning with whitespace). RFC 9112 section
+        // 7.1.4 says a server MUST either reject such a message with 400 (Bad Request) or replace
+        // the folding with spaces. Folding is never used legitimately and has historically been a
+        // source of HTTP desync, so we reject.
+        return false;
+      }
       addNoCheck(name, line);
     } else {
       return false;
@@ -1073,18 +1153,22 @@ bool HttpHeaders::parseHeaders(char* ptr, char* end) {
 kj::String HttpHeaders::serializeRequest(
     HttpMethod method, kj::StringPtr url,
     kj::ArrayPtr<const kj::StringPtr> connectionHeaders) const {
+  requireValidRequestUrl(url);
   return serialize(kj::toCharSequence(method), url, "HTTP/1.1"_kj, connectionHeaders);
 }
 
 kj::String HttpHeaders::serializeConnectRequest(
     kj::StringPtr authority,
     kj::ArrayPtr<const kj::StringPtr> connectionHeaders) const {
+  requireValidRequestUrl(authority);
   return serialize("CONNECT"_kj, authority, "HTTP/1.1"_kj, connectionHeaders);
 }
 
 kj::String HttpHeaders::serializeResponse(
     uint statusCode, kj::StringPtr statusText,
     kj::ArrayPtr<const kj::StringPtr> connectionHeaders) const {
+  requireValidStatusText(statusText);
+
   auto statusCodeStr = kj::toCharSequence(statusCode);
 
   return serialize("HTTP/1.1"_kj, statusCodeStr, statusText, connectionHeaders);
@@ -1186,8 +1270,8 @@ static bool consumeByteRangeUnit(const char*& ptr) {
 static kj::Maybe<HttpByteRange> consumeIntRange(const char*& ptr, uint64_t contentLength) {
   const char* p = ptr;
   p = skipSpace(p);
-  uint firstPos;
-  KJ_IF_SOME(n, consumeNumber(p)) {
+  uint64_t firstPos;
+  KJ_IF_SOME(n, consumeNumber64(p)) {
     firstPos = n;
   } else {
     return kj::none;
@@ -1195,7 +1279,7 @@ static kj::Maybe<HttpByteRange> consumeIntRange(const char*& ptr, uint64_t conte
   p = skipSpace(p);
   if (*(p++) != '-') return kj::none;
   p = skipSpace(p);
-  auto maybeLastPos = consumeNumber(p);
+  auto maybeLastPos = consumeNumber64(p);
   p = skipSpace(p);
 
   KJ_IF_SOME(lastPos, maybeLastPos) {
@@ -1218,8 +1302,8 @@ static kj::Maybe<HttpByteRange> consumeSuffixRange(const char*& ptr, uint64_t co
   p = skipSpace(p);
   if (*(p++) != '-') return kj::none;
   p = skipSpace(p);
-  uint suffixLength;
-  KJ_IF_SOME(n, consumeNumber(p)) {
+  uint64_t suffixLength;
+  KJ_IF_SOME(n, consumeNumber64(p)) {
     suffixLength = n;
   } else {
     return kj::none;

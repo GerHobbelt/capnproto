@@ -311,6 +311,104 @@ KJ_TEST("HttpHeaders parse invalid") {
   }
 }
 
+KJ_TEST("HttpHeaders reject whitespace before colon") {
+  // RFC 9112 section 5.1 requires rejecting a header with whitespace between the field name and the
+  // colon. Historically KJ silently stripped it, which -- paired with a peer that treats the space
+  // as part of the name -- could enable HTTP desync / request smuggling.
+  auto table = HttpHeaderTable::Builder().build();
+  HttpHeaders headers(*table);
+
+  // Space before the colon.
+  {
+    auto input = kj::heapString(
+        "POST   /some/path   HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Content-Length : 0\r\n"
+        "\r\n");
+
+    auto protocolError = headers.tryParseRequest(input).get<HttpHeaders::ProtocolError>();
+
+    KJ_EXPECT(protocolError.statusCode == 400, protocolError.statusCode);
+    KJ_EXPECT(protocolError.description == "The headers sent by your client are not valid.",
+        protocolError.description);
+  }
+
+  // Tab before the colon.
+  {
+    auto input = kj::heapString(
+        "POST   /some/path   HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Content-Length\t: 0\r\n"
+        "\r\n");
+
+    auto protocolError = headers.tryParseRequest(input).get<HttpHeaders::ProtocolError>();
+
+    KJ_EXPECT(protocolError.statusCode == 400, protocolError.statusCode);
+  }
+
+  // Whitespace *after* the colon (i.e. before the value) is still allowed and stripped.
+  {
+    auto input = kj::heapString(
+        "POST   /some/path   HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Content-Length:    123\r\n"
+        "\r\n");
+
+    auto result = headers.tryParseRequest(input).get<HttpHeaders::Request>();
+    KJ_EXPECT(result.method == HttpMethod::POST);
+    KJ_EXPECT(KJ_ASSERT_NONNULL(headers.get(HttpHeaderId::CONTENT_LENGTH)) == "123");
+  }
+}
+
+KJ_TEST("HttpHeaders reject obsolete line folding") {
+  // RFC 9112 section 7.1.4 deprecates line folding and allows rejecting it with 400 (Bad Request).
+  // Folding has historically been a source of HTTP desync when peers disagree about whether a
+  // folded line is a continuation or a new header, so KJ rejects it.
+  auto table = HttpHeaderTable::Builder().build();
+
+  // Folded value with a leading space on the continuation line.
+  {
+    HttpHeaders headers(*table);
+    auto input = kj::heapString(
+        "POST   /some/path   HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Some-Header: a really long\r\n"
+        "   header value\r\n"
+        "\r\n");
+
+    auto protocolError = headers.tryParseRequest(input).get<HttpHeaders::ProtocolError>();
+    KJ_EXPECT(protocolError.statusCode == 400, protocolError.statusCode);
+  }
+
+  // Folded value with a leading tab on the continuation line.
+  {
+    HttpHeaders headers(*table);
+    auto input = kj::heapString(
+        "POST   /some/path   HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Some-Header: a really long\r\n"
+        "\theader value\r\n"
+        "\r\n");
+
+    auto protocolError = headers.tryParseRequest(input).get<HttpHeaders::ProtocolError>();
+    KJ_EXPECT(protocolError.statusCode == 400, protocolError.statusCode);
+  }
+
+  // Folding used to smuggle what looks like a separate header.
+  {
+    HttpHeaders headers(*table);
+    auto input = kj::heapString(
+        "HTTP/1.1 200 OK\r\n"
+        "Host: example.com\r\n"
+        "Some-Header: value\r\n"
+        " Smuggled-Header: value\r\n"
+        "\r\n");
+
+    auto protocolError = headers.tryParseResponse(input).get<HttpHeaders::ProtocolError>();
+    KJ_EXPECT(protocolError.statusCode == 502, protocolError.statusCode);
+  }
+}
+
 KJ_TEST("HttpHeaders require valid HttpHeaderTable") {
   const auto ERROR_MESSAGE =
       "HttpHeaders object was constructed from HttpHeaderTable "
@@ -374,6 +472,52 @@ KJ_TEST("HttpHeaders validation") {
 
   KJ_EXPECT_THROW_MESSAGE("invalid header value", headers.setPtr(HttpHeaderId::HOST, "in\nvalid"));
   KJ_EXPECT_THROW_MESSAGE("invalid header value", headers.addPtrPtr("Valid-Name", "in\nvalid"));
+}
+
+KJ_TEST("HttpHeaders serialization validation") {
+  // The serialization functions must reject request URLs and status texts containing characters
+  // that would allow HTTP desync / request smuggling (e.g. when http-over-capnp forwards untrusted
+  // metadata to a plain-HTTP connection). See GHSL-2026-146.
+  auto table = HttpHeaderTable::Builder().build();
+  HttpHeaders headers(*table);
+
+  // Valid values serialize fine.
+  KJ_EXPECT(headers.serializeRequest(HttpMethod::GET, "/some/path?query=1") ==
+      "GET /some/path?query=1 HTTP/1.1\r\n\r\n");
+  KJ_EXPECT(headers.serializeResponse(200, "OK") ==
+      "HTTP/1.1 200 OK\r\n\r\n");
+
+  // A CRLF in the URL could inject headers or an entire second request.
+  KJ_EXPECT_THROW_MESSAGE("invalid request URL",
+      headers.serializeRequest(HttpMethod::GET, "/foo\r\nX-Injected: 1"));
+
+  // A bare LF is equally dangerous.
+  KJ_EXPECT_THROW_MESSAGE("invalid request URL",
+      headers.serializeRequest(HttpMethod::GET, "/foo\nbar"));
+
+  // A space in the request-target would introduce an extra token into the request line.
+  KJ_EXPECT_THROW_MESSAGE("invalid request URL",
+      headers.serializeRequest(HttpMethod::GET, "/foo bar"));
+
+  // A NUL byte terminates the C string and could truncate the request line.
+  KJ_EXPECT_THROW_MESSAGE("invalid request URL",
+      headers.serializeRequest(HttpMethod::GET, kj::StringPtr("/foo\0bar", 8)));
+
+  // CONNECT authority is validated too.
+  KJ_EXPECT_THROW_MESSAGE("invalid request URL",
+      headers.serializeConnectRequest("example.com:443\r\nX-Injected: 1"));
+
+  // A CRLF in the status text could inject headers into the response.
+  KJ_EXPECT_THROW_MESSAGE("invalid status text",
+      headers.serializeResponse(200, "OK\r\nX-Injected: 1"));
+
+  // A bare LF is equally dangerous.
+  KJ_EXPECT_THROW_MESSAGE("invalid status text",
+      headers.serializeResponse(200, "OK\nfoo"));
+
+  // Status text may legitimately contain spaces.
+  KJ_EXPECT(headers.serializeResponse(418, "I'm a teapot") ==
+      "HTTP/1.1 418 I'm a teapot\r\n\r\n");
 }
 
 KJ_TEST("HttpHeaders Set-Cookie handling") {
@@ -8144,6 +8288,12 @@ KJ_TEST("Range header parsing") {
     {"bytes=5-"_kjc,                  2},
     // Check multiple valid ranges accepted
     {"bytes=  1-  ,6-, 10-11 "_kjc,  12, {{1,11},{6,11},{10,11}}},
+    // Check positions past 2^32 are not truncated against a 64-bit content length
+    {"bytes=5000000000-5000000001"_kjc, 8000000000, {{5000000000, 5000000001}}},
+    {"bytes=5000000000-"_kjc,           8000000000, {{5000000000, 7999999999}}},
+    {"bytes=-5000000000"_kjc,           8000000000, {{3000000000, 7999999999}}},
+    // Check a start position past the content is rejected rather than wrapping into range
+    {"bytes=4294967298-"_kjc,                    8},
 
     // ===== Suffix =====
     // Check valid ranges accepted
@@ -8152,6 +8302,24 @@ KJ_TEST("Range header parsing") {
     // Check start after content truncated and entire response response
     {"bytes=-7"_kjc,                  7, HttpEverythingRange {}},
     {"bytes=-10"_kjc,                 5, HttpEverythingRange {}},
+    // Check the top of the uint64 range parses without overflow, and values past uint64 max are
+    // rejected rather than wrapping. A suffix length >= content resolves to the whole resource, so
+    // each value that parses yields everything while a rejected one falls through to unsatisfiable.
+    {"bytes=-18446744073709551615"_kjc, 4, HttpEverythingRange {}},  // 2^64 - 1
+    {"bytes=-18446744073709551614"_kjc, 4, HttpEverythingRange {}},
+    {"bytes=-18446744073709551613"_kjc, 4, HttpEverythingRange {}},
+    {"bytes=-18446744073709551612"_kjc, 4, HttpEverythingRange {}},
+    {"bytes=-18446744073709551611"_kjc, 4, HttpEverythingRange {}},
+    {"bytes=-18446744073709551610"_kjc, 4, HttpEverythingRange {}},
+    {"bytes=-18446744073709551609"_kjc, 4, HttpEverythingRange {}},
+    {"bytes=-18446744073709551608"_kjc, 4, HttpEverythingRange {}},
+    {"bytes=-18446744073709551607"_kjc, 4, HttpEverythingRange {}},
+    {"bytes=-18446744073709551606"_kjc, 4, HttpEverythingRange {}},
+    // 2^64 and beyond must be rejected, not wrapped down into a satisfiable length
+    {"bytes=-18446744073709551616"_kjc, 4},
+    {"bytes=-18446744073709551617"_kjc, 4},
+    {"bytes=-18446744073709551620"_kjc, 4},
+    {"bytes=-99999999999999999999"_kjc, 4},
     // Check if any range returns entire response, other ranges ignored
     {"bytes=0-1,-5,2-3"_kjc,          5, HttpEverythingRange {}},
     // Check unsatisfiable empty range ignored
