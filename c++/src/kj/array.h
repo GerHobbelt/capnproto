@@ -272,6 +272,10 @@ public:
   // Syntax sugar for invoking asImpl(U*, const Array&).
   // Used to chain conversion calls rather than wrap with function.
 
+  auto clone() requires (Cloneable<T> || Copyable<T>);
+  auto clone() const requires (Cloneable<const T> || Copyable<const T>);
+  // Deep-clone or copy to a new heap array element-by-element.
+
   inline bool hasNullDisposer() const {return disposer == &NullArrayDisposer::instance; }
   // Returns true if array uses NullArrayDisposer, intended for use with string literal
   // ConstStrings.
@@ -371,13 +375,13 @@ public:
                         const ArrayDisposer& disposer)
       : ptr(firstElement), pos(firstElement), endPtr(firstElement + capacity),
         disposer(&disposer) {}
-  ArrayBuilder(ArrayBuilder&& other)
+  ArrayBuilder(ArrayBuilder&& other) noexcept
       : ptr(other.ptr), pos(other.pos), endPtr(other.endPtr), disposer(other.disposer) {
     other.ptr = nullptr;
     other.pos = nullptr;
     other.endPtr = nullptr;
   }
-  ArrayBuilder(Array<T>&& other)
+  ArrayBuilder(Array<T>&& other) noexcept
       : ptr(other.ptr), pos(other.ptr + other.size_), endPtr(pos), disposer(other.disposer) {
     // Create an already-full ArrayBuilder from an Array of the same type. This constructor
     // primarily exists to enable Vector<T> to be constructed from Array<T>.
@@ -947,6 +951,26 @@ heapArray(Iterator begin, Iterator end) {
 template <typename T>
 inline Array<T> heapArray(std::initializer_list<T> init) {
   return heapArray<T>(init.begin(), init.end());
+}
+
+template <typename T>
+inline auto ArrayPtr<T>::clone() requires (Cloneable<T> || Copyable<T>) {
+  return KJ_MAP(value, *this) { return _::copyOrClone(value); };
+}
+
+template <typename T>
+inline auto ArrayPtr<T>::clone() const requires (Cloneable<const T> || Copyable<const T>) {
+  return KJ_MAP(value, *this) { return _::copyOrClone(value); };
+}
+
+template <typename T>
+inline auto Array<T>::clone() requires (Cloneable<T> || Copyable<T>) {
+  return asPtr().clone();
+}
+
+template <typename T>
+inline auto Array<T>::clone() const requires (Cloneable<const T> || Copyable<const T>) {
+  return asPtr().clone();
 }
 
 template <typename T, typename... Params>

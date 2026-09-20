@@ -984,7 +984,7 @@ String KJ_STRINGIFY(const Exception& e) {
              stringifyStackTrace(e.getStackTrace()));
 }
 
-static_assert(sizeof(kj::Exception) == 2 * sizeof(size_t),
+static_assert(sizeof(kj::Exception) == sizeof(size_t),
     "exception type is too big, please keep it lean");
 
 Exception::Exception(Type type, const char* file, int line, String description) noexcept {
@@ -1002,34 +1002,33 @@ Exception::Exception(Type type, String file, int line, String description) noexc
   storage->description = mv(description);
 }
 
-Exception::Exception(const Exception& other) noexcept {
-  storage->file = other.storage->file;
-  storage->line = other.storage->line;
-  storage->type = other.storage->type;
-  storage->description = heapString(other.storage->description);
+Exception Exception::clone() const noexcept {
+  Exception copy(storage->type, storage->file, storage->line, heapString(storage->description));
 
-  if (other.storage->ownFile != nullptr) {
-    storage->ownFile = heapString(other.storage->ownFile);
-    storage->file = trimSourceFilename(storage->ownFile).cStr();
+  if (storage->ownFile != nullptr) {
+    copy.storage->ownFile = heapString(storage->ownFile);
+    copy.storage->file = trimSourceFilename(copy.storage->ownFile).cStr();
   }
 
-  if (other.storage->remoteTrace != nullptr) {
-    storage->remoteTrace = kj::str(other.storage->remoteTrace);
+  if (storage->remoteTrace != nullptr) {
+    copy.storage->remoteTrace = kj::str(storage->remoteTrace);
   }
 
-  storage->traceCount = other.storage->traceCount;
-  memcpy(storage->trace, other.storage->trace, sizeof(storage->trace[0]) * storage->traceCount);
+  copy.storage->traceCount = storage->traceCount;
+  memcpy(copy.storage->trace, storage->trace, sizeof(copy.storage->trace[0]) * copy.storage->traceCount);
 
-  KJ_IF_SOME(c, other.storage->context) {
-    storage->context = heap(*c);
+  KJ_IF_SOME(c, storage->context) {
+    copy.storage->context = heap(*c);
   }
 
-  for (auto& detail: other.storage->details) {
-    storage->details.add(Detail {
+  for (auto& detail: storage->details) {
+    copy.storage->details.add(Detail {
       .id = detail.id,
       .value = kj::heapArray(detail.value.asPtr()),
     });
   }
+
+  return copy;
 }
 
 Exception::~Exception() noexcept {}
@@ -1191,10 +1190,7 @@ public:
   inline ExceptionImpl(Exception&& other): Exception(mv(other)) {
     insertIntoCurrentExceptions();
   }
-  ExceptionImpl(const ExceptionImpl& other): Exception(other) {
-    // No need to copy whatBuffer since it's just to hold the return value of what().
-    insertIntoCurrentExceptions();
-  }
+
   ~ExceptionImpl() noexcept {
     // Look for ourselves in the list.
     validateExceptionPointer(nextCurrentException);
@@ -1252,7 +1248,7 @@ kj::Exception getDestructionReason(void* traceSeparator, kj::Exception::Type def
     const char* defaultFile, int defaultLine, kj::StringPtr defaultDescription) {
   InFlightExceptionIterator iter;
   KJ_IF_SOME(e, iter.next()) {
-    auto copy = kj::cp(e);
+    auto copy = e.clone();
     copy.truncateCommonTrace();
     return copy;
   } else {

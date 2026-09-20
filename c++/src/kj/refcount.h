@@ -172,7 +172,7 @@ public:
   inline Rc(Rc&& other) noexcept = default;
 
   template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
-  inline Rc(Rc<U>&& other) noexcept : own(kj::mv(other.own)) { }
+  inline Rc(Rc<U>&& other) noexcept : own(other.own.template disown<Rc<U>>()) { }
 
   kj::Own<T> toOwn() {
     // Convert Rc<T> to Own<T>.
@@ -189,6 +189,10 @@ public:
     }
   }
 
+  kj::Rc<T> clone() {
+    return addRef();
+  }
+
   Rc& operator=(decltype(nullptr)) {
     own = nullptr;
     return *this;
@@ -198,7 +202,9 @@ public:
 
   template <typename U>
   Rc<U> downcast() {
-    return Rc<U>(own.template downcast<U>());
+    T* t = own.template disown<Rc>();
+    U* u = &kj::downcast<U>(*t);
+    return Rc<U>(u);
   }
 
   inline bool operator==(const Rc<T>& other) const { return own.get() == other.own.get(); }
@@ -211,12 +217,21 @@ public:
   inline const T* get() const { return own.get(); }
 
 private:
-  Rc(T* t) : own(t, *t) { }
-  Rc(Own<T>&& t) : own(kj::mv(t)) { }
+  Rc(T* t) : own(t) { }
+  Rc(Own<T, Rc>&& t) : own(kj::mv(t)) { }
 
-  Own<T> own;
+  Own<T, Rc> own;
+  // Rc is its own disposer.
+
+  inline static void dispose(T* t) {
+    if (--t->refcount == 0) delete t;
+  };
 
   friend class Refcounted;
+
+  // dispose access
+  friend class Own<T, Rc>;
+  friend class _::StaticDisposerAdapter<T, Rc>;
 
   template <typename>
   friend class Rc;
@@ -442,6 +457,10 @@ public:
     } else {
       return kj::Arc<T>();
     }
+  }
+
+  kj::Arc<T> clone() const {
+    return addRef();
   }
 
   // Surrenders ownership of the underlying object to the caller. Unlike Own<T>::disown(), there

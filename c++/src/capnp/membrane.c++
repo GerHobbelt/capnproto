@@ -623,5 +623,16 @@ _::OrphanBuilder copyOutOfMembrane(ListReader from, Orphanage to,
 
 }  // namespace _ (private)
 
+AnyPointer::Pipeline membranePipeline(AnyPointer::Pipeline inner, kj::Own<MembranePolicy> policy) {
+  return AnyPointer::Pipeline(kj::refcounted<MembranePipelineHook>(
+      PipelineHook::from(kj::mv(inner)), kj::mv(policy), false));
+}
+
+AnyPointer::Pipeline reverseMembranePipeline(
+    AnyPointer::Pipeline inner, kj::Own<MembranePolicy> policy) {
+  return AnyPointer::Pipeline(kj::refcounted<MembranePipelineHook>(
+      PipelineHook::from(kj::mv(inner)), kj::mv(policy), true));
+}
+
 }  // namespace capnp
 

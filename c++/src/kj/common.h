@@ -703,8 +703,8 @@ private:
 template<typename T> constexpr T&& mv(T& t) noexcept { return static_cast<T&&>(t); }
 template<typename T> constexpr T&& fwd(NoInfer<T>& t) noexcept { return static_cast<T&&>(t); }
 
-template<typename T> constexpr T cp(T& t) noexcept { return t; }
-template<typename T> constexpr T cp(const T& t) noexcept { return t; }
+template<typename T> constexpr T cp(T& t) noexcept { return T(t); }
+template<typename T> constexpr T cp(const T& t) noexcept { return T(t); }
 // Useful to force a copy, particularly to pass into a function that expects T&&.
 
 template <typename T, typename U, bool takeT, bool uOK = true> struct ChooseType_;
@@ -1247,6 +1247,50 @@ template <typename T, typename U>
 concept ConstructibleFrom = requires(U&& u) { T(kj::fwd<U>(u)); };
 // Concept: T has a constructor that accepts U&&.
 
+template <typename T, typename U>
+concept NoThrowConstructibleFrom = requires(U&& u) {
+  T(kj::fwd<U>(u));
+  requires noexcept(new ((void*)nullptr, _::PlacementNew()) T(kj::fwd<U>(u)));
+};
+// Concept: T has a noexcept constructor that accepts U&&.
+
+}  // namespace _ (private)
+
+template <typename T, typename U = T>
+constexpr bool isNoThrowMoveConstructible() {
+  // like std::is_nothrow_move_constructible but that ignores noexcept(false) destructors
+  if constexpr (isReference<T>()) return true;
+  else return _::NoThrowConstructibleFrom<T, U>;
+}
+
+template <typename T>
+concept Cloneable = requires(T& value) { value.clone(); };
+// Concept: `T` has a `clone()` member callable on a `T&`.
+// Note that this supports mutable cloning because we do not hide interior mutability like
+// Rust does.
+// `Cloneable<const T>` represent a const-cloneable object which is similar to Rust `Clone`.
+
+template <typename T>
+concept Copyable = _::ConstructibleFrom<T, T&>;
+// Concept: T has a copy constructor callable on a `T&`.
+// Supports mutable copying similar to `Cloneable<T>`.
+// Unlike Rust this does not represent trivial to copy object, but simply an object with available
+// copy constructor.
+// By KJ conventions we avoid heap allocations in copy constructors. Despite of this copying a
+// complicated object might still be expensive.
+
+namespace _ {  // private
+
+template <typename T>
+auto copyOrClone(T& value) requires Cloneable<T> {
+  return value.clone();
+}
+
+template <typename T>
+Decay<T> copyOrClone(T& value) requires (!Cloneable<T> && Copyable<T>) {
+  return Decay<T>(value);
+}
+
 }  // namespace _ (private)
 
 template <typename T>
@@ -1298,7 +1342,11 @@ public:
       noexcept(noexcept(instance<T&>().~T()))
 #endif
   {
-    destroy();
+    if constexpr (noexcept(instance<T&>().~T())) {
+      if (isSet) { dtor(value); }
+    } else {
+      destroy();
+    }
   }
 
   inline T& operator*() & { return value; }
@@ -1507,7 +1555,11 @@ public:
       noexcept(noexcept(instance<T&>().~T()))
 #endif
   {
-    destroy();
+    if constexpr (noexcept(instance<T&>().~T())) {
+      if (!isNone(value)) { dtor(value); }
+    } else {
+      destroy();
+    }
   }
 
   inline T& operator*() & { return value; }
@@ -1796,15 +1848,15 @@ class Maybe {
 
 public:
   Maybe(): ptr(nullptr) {}
-  Maybe(T&& t): ptr(kj::mv(t)) {}
+  Maybe(T&& t) noexcept(isNoThrowMoveConstructible<T>()): ptr(kj::mv(t)) {}
   Maybe(T& t): ptr(t) {}
   Maybe(const T& t): ptr(t) {}
-  Maybe(Maybe&& other): ptr(kj::mv(other.ptr)) {}
+  Maybe(Maybe&& other) noexcept(isNoThrowMoveConstructible<T>()): ptr(kj::mv(other.ptr)) {}
   Maybe(const Maybe& other): ptr(other.ptr) {}
   Maybe(Maybe& other): ptr(other.ptr) {}
 
   template <typename U>
-  Maybe(Maybe<U>&& other) {
+  Maybe(Maybe<U>&& other) noexcept(isNoThrowMoveConstructible<T, U>()) {
     KJ_IF_SOME(val, kj::mv(other)) {
       ptr.emplaceInit(kj::mv(val));
     }
@@ -1827,7 +1879,7 @@ public:
     requires _::HasConvertingConstructorFlag<T> &&  // Only when MaybeTraits<T> opts in
              _::ConstructibleFrom<T, U>
   explicit(!canConvert<U&&, T>())  // Implicit when U→T is implicit, explicit otherwise
-  Maybe(U&& value): ptr(kj::fwd<U>(value)) {}
+  Maybe(U&& value) noexcept(isNoThrowMoveConstructible<T, U>()): ptr(kj::fwd<U>(value)) {}
   // Converting constructor: allows constructing Maybe<T> from a U that is convertible to T.
   // Only exists when MaybeTraits<T>::convertingConstructor is true.
   // Implicit when U is implicitly convertible to T, explicit otherwise.
@@ -2116,6 +2168,28 @@ public:
     }
   }
 
+  auto clone() requires Cloneable<T> {
+    // Clones the value if it is not none.
+    // Returns Maybe<decltype(t.clone())>
+    using U = decltype(instance<T&>().clone());
+    if (ptr == nullptr) {
+      return Maybe<U>(kj::none);
+    } else {
+      return Maybe<U>(ptr->clone());
+    }
+  }
+
+  auto clone() const requires Cloneable<const T> {
+    // Clones the value if it is not none.
+    // Returns Maybe<decltype(t.clone())>
+    using U = decltype(instance<const T&>().clone());
+    if (ptr == nullptr) {
+      return Maybe<U>(kj::none);
+    } else {
+      return Maybe<U>(ptr->clone());
+    }
+  }
+
   template <typename Func>
   auto map(Func&& f) & -> Maybe<decltype(f(instance<T&>()))> {
     // See KJ_MAP for a more ergonomic interface.
@@ -2184,14 +2258,14 @@ public:
   // to override the move constructor, and if we override the move constructor then we must define
   // the copy constructor here.
 
-  inline constexpr Maybe(Maybe&& other): ptr(other.ptr) { other.ptr = nullptr; }
+  inline constexpr Maybe(Maybe&& other) noexcept: ptr(other.ptr) { other.ptr = nullptr; }
 
   template <typename U>
   inline constexpr Maybe(Maybe<U&>& other): ptr(other.ptr) {}
   template <typename U>
   inline constexpr Maybe(const Maybe<U&>& other): ptr(const_cast<const U*>(other.ptr)) {}
   template <typename U>
-  inline constexpr Maybe(Maybe<U&>&& other): ptr(other.ptr) { other.ptr = nullptr; }
+  inline constexpr Maybe(Maybe<U&>&& other) noexcept: ptr(other.ptr) { other.ptr = nullptr; }
   template <typename U>
   inline constexpr Maybe(const Maybe<U&>&& other) = delete;
   template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
@@ -2237,6 +2311,27 @@ public:
       return defaultValue;
     } else {
       return *ptr;
+    }
+  }
+
+  auto clone() requires Cloneable<T> {
+    // Clones the value (not a reference) if reference is not none.
+    using U = decltype(instance<T&>().clone());
+    if (ptr == nullptr) {
+      return Maybe<U>(kj::none);
+    } else {
+      return Maybe<U>(ptr->clone());
+    }
+  }
+
+  auto clone() const requires Cloneable<const T> {
+    // Clones the value (not a reference) if reference is not none.
+    using U = decltype(instance<const T&>().clone());
+    if (ptr == nullptr) {
+      return Maybe<U>(kj::none);
+    } else {
+      const T& ref = *ptr;
+      return Maybe<U>(ref.clone());
     }
   }
 
@@ -2588,6 +2683,10 @@ public:
   inline auto as() const { return asImpl((U*)nullptr, *this); }
   // Syntax sugar for invoking asImpl(U*, const ArrayPtr&).
   // Used to chain conversion calls rather than wrap with function.
+
+  auto clone() requires (Cloneable<T> || Copyable<T>);
+  auto clone() const requires (Cloneable<const T> || Copyable<const T>);
+  // Deep-clone or copy into a heap-owned array.
 
   inline void fill(T t) {
     // Fill the area by copying t over every element.

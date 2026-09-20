@@ -29,6 +29,40 @@
 namespace kj {
 namespace {
 
+struct CloneableElement {
+  int clone() const { return 123; }
+};
+
+struct NonConstCloneableElement {
+  int clone() { return 123; }
+};
+
+struct NonCloneableElement {};
+
+struct NonCloneableNonCopyableElement {
+  NonCloneableNonCopyableElement() = default;
+  NonCloneableNonCopyableElement(const NonCloneableNonCopyableElement&) = delete;
+};
+
+static_assert(Cloneable<Array<CloneableElement>>);
+static_assert(Cloneable<const Array<CloneableElement>>);
+static_assert(Cloneable<ArrayPtr<CloneableElement>>);
+static_assert(Cloneable<const ArrayPtr<CloneableElement>>);
+static_assert(Cloneable<Array<NonConstCloneableElement>>);
+static_assert(Cloneable<const Array<NonConstCloneableElement>>);
+static_assert(Cloneable<ArrayPtr<NonConstCloneableElement>>);
+static_assert(Cloneable<const ArrayPtr<NonConstCloneableElement>>);
+static_assert(Cloneable<Array<NonCloneableElement>>);
+static_assert(Cloneable<const Array<NonCloneableElement>>);
+static_assert(Cloneable<ArrayPtr<NonCloneableElement>>);
+static_assert(Cloneable<const ArrayPtr<NonCloneableElement>>);
+static_assert(Cloneable<Array<int>>);
+static_assert(Cloneable<const Array<int>>);
+static_assert(Cloneable<ArrayPtr<int>>);
+static_assert(Cloneable<const ArrayPtr<int>>);
+static_assert(!Cloneable<Array<NonCloneableNonCopyableElement>>);
+static_assert(!Cloneable<ArrayPtr<NonCloneableNonCopyableElement>>);
+
 struct TestObject {
   TestObject() {
     index = count;
@@ -402,6 +436,46 @@ TEST(Array, HeapCopy) {
     EXPECT_EQ(3u, copy.size());
     EXPECT_EQ(kj::str(copy.first(3)), "baz"_kj);
   }
+}
+
+KJ_TEST("ArrayPtr clone") {
+  StringPtr values[] = {"foo", "bar"};
+  ArrayPtr<const StringPtr> original(values);
+  Array<String> cloned = original.clone();
+  ASSERT_EQ(2u, cloned.size());
+  EXPECT_EQ(cloned[0], "foo");
+  EXPECT_EQ(cloned[1], "bar");
+  EXPECT_NE(cloned[0].begin(), original[0].begin());
+  EXPECT_NE(cloned[1].begin(), original[1].begin());
+}
+
+KJ_TEST("Array clone") {
+  Array<const StringPtr> original = heapArray<const StringPtr>({"baz", "qux"});
+  Array<String> cloned = original.clone();
+  ASSERT_EQ(2u, cloned.size());
+  EXPECT_EQ(cloned[0], "baz");
+  EXPECT_EQ(cloned[1], "qux");
+  EXPECT_NE(cloned[0].begin(), original[0].begin());
+  EXPECT_NE(cloned[1].begin(), original[1].begin());
+}
+
+KJ_TEST("ArrayPtr clone copies copyable elements") {
+  int values[] = {12, 34};
+  ArrayPtr<const int> original(values);
+  Array<int> cloned = original.clone();
+  ASSERT_EQ(2u, cloned.size());
+  EXPECT_EQ(cloned[0], 12);
+  EXPECT_EQ(cloned[1], 34);
+  EXPECT_NE(cloned.begin(), original.begin());
+}
+
+KJ_TEST("Array clone copies copyable elements") {
+  Array<int> original = heapArray<int>({56, 78});
+  Array<int> cloned = original.clone();
+  ASSERT_EQ(2u, cloned.size());
+  EXPECT_EQ(cloned[0], 56);
+  EXPECT_EQ(cloned[1], 78);
+  EXPECT_NE(cloned.begin(), original.begin());
 }
 
 TEST(Array, OwnConst) {

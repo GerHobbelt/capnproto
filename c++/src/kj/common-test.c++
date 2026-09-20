@@ -22,12 +22,37 @@
 #include "common.h"
 #include "test.h"
 #include <inttypes.h>
+#include <type_traits>
 #include <kj/compat/gtest.h>
 #include <span>
 #include "thread.h"
 
 namespace kj {
 namespace {
+
+struct ClonesToInt { int clone() const { return 123; } };
+struct ClonesToStringPtr { StringPtr clone() const { return "foo"; } };
+struct NoClone {};
+struct NonConstClone { int clone() { return 123; } };
+struct HasCopy { HasCopy() = default; HasCopy(const HasCopy&) = default; };
+struct NoCopy { NoCopy() = default; NoCopy(const NoCopy&) = delete; };
+struct NonConstCopy {
+  NonConstCopy() = default;
+  NonConstCopy(NonConstCopy&) {}
+};
+
+static_assert(Cloneable<ClonesToInt>);
+static_assert(Cloneable<ClonesToStringPtr>);
+static_assert(!Cloneable<NoClone>);
+static_assert(Cloneable<NonConstClone>);
+static_assert(!Cloneable<const NonConstClone>);
+
+static_assert(Copyable<int>);
+static_assert(Copyable<const int>);
+static_assert(Copyable<HasCopy>);
+static_assert(!Copyable<NoCopy>);
+static_assert(Copyable<NonConstCopy>);
+static_assert(!Copyable<const NonConstCopy>);
 
 KJ_ASSERT_CAN_MEMCPY(char);
 KJ_ASSERT_CAN_MEMCPY(byte);
@@ -168,6 +193,89 @@ TEST(Common, CanConvert) {
 
   static_assert(canConvert<void*, const void*>(), "failure");
   static_assert(!canConvert<const void*, void*>(), "failure");
+}
+
+KJ_TEST("isNoThrowMoveConstructible") {
+  static_assert(_::NoThrowConstructibleFrom<int, int>);
+
+  struct ExplicitThrowingInt {
+    ExplicitThrowingInt(int) noexcept(false) {}
+  };
+  static_assert(!_::NoThrowConstructibleFrom<ExplicitThrowingInt, int>);
+
+  // T == U cases
+  static_assert(isNoThrowMoveConstructible<int>());
+  static_assert(isNoThrowMoveConstructible<int&>());
+  static_assert(isNoThrowMoveConstructible<int*>());
+
+  struct ImplicitMove {};
+  static_assert(isNoThrowMoveConstructible<ImplicitMove>());
+
+  struct ExplicitNoThrowMove {
+    ExplicitNoThrowMove() = default;
+    ExplicitNoThrowMove(ExplicitNoThrowMove&&) noexcept = default;
+  };
+  static_assert(isNoThrowMoveConstructible<ExplicitNoThrowMove>());
+
+  struct ExplicitThrowingMove {
+    ExplicitThrowingMove() = default;
+    ExplicitThrowingMove(ExplicitThrowingMove&&) noexcept(false) {}
+  };
+  static_assert(!isNoThrowMoveConstructible<ExplicitThrowingMove>());
+  static_assert(isNoThrowMoveConstructible<ExplicitThrowingMove&>());
+  static_assert(isNoThrowMoveConstructible<ExplicitThrowingMove*>());
+
+  struct CopyOnlyNoThrow {
+    CopyOnlyNoThrow() = default;
+    CopyOnlyNoThrow(const CopyOnlyNoThrow&) noexcept {}
+  };
+  static_assert(isNoThrowMoveConstructible<CopyOnlyNoThrow>());
+
+  struct CopyOnlyThrowing {
+    CopyOnlyThrowing() = default;
+    CopyOnlyThrowing(const CopyOnlyThrowing&) noexcept(false) {}
+  };
+  static_assert(!isNoThrowMoveConstructible<CopyOnlyThrowing>());
+
+  struct ThrowingDestructor {
+    ThrowingDestructor() = default;
+    ThrowingDestructor(ThrowingDestructor&&) noexcept = default;
+    ~ThrowingDestructor() noexcept(false) {}
+  };
+  // this is where we intentionally differ from std
+  static_assert(isNoThrowMoveConstructible<ThrowingDestructor>());
+  static_assert(!std::is_nothrow_move_constructible_v<ThrowingDestructor>);
+
+  // T != U
+
+  struct Source {};
+
+  struct NoThrowFromSource {
+    NoThrowFromSource(Source&&) noexcept {}
+  };
+  static_assert(isNoThrowMoveConstructible<NoThrowFromSource, Source>());
+
+  struct ThrowingFromSource {
+    ThrowingFromSource(Source&&) noexcept(false) {}
+  };
+  static_assert(!isNoThrowMoveConstructible<ThrowingFromSource, Source>());
+
+  struct NoThrowCopyFromSource {
+    NoThrowCopyFromSource(const Source&) noexcept {}
+  };
+  static_assert(isNoThrowMoveConstructible<NoThrowCopyFromSource, const Source&>());
+
+  struct ThrowingCopyFromSource {
+    ThrowingCopyFromSource(const Source&) noexcept(false) {}
+  };
+  static_assert(!isNoThrowMoveConstructible<ThrowingCopyFromSource, const Source&>());
+
+  struct CrossTypeThrowingDestructor {
+    CrossTypeThrowingDestructor(Source&&) noexcept {}
+    ~CrossTypeThrowingDestructor() noexcept(false) {}
+  };
+  static_assert(isNoThrowMoveConstructible<CrossTypeThrowingDestructor, Source>());
+  static_assert(!std::is_nothrow_constructible_v<CrossTypeThrowingDestructor, Source&&>);
 }
 
 TEST(Common, ArrayAsBytes) {
@@ -786,6 +894,52 @@ KJ_TEST("ThreadId") {
 
     KJ_EXPECT_THROW_MESSAGE("expected id == &currentThreadId", id1.assertCurrentThread());
   });
+}
+
+class ExplicitCopy {
+public:
+  ExplicitCopy() {}
+  explicit ExplicitCopy(const ExplicitCopy& other) = default;
+  ExplicitCopy(ExplicitCopy&& other) = delete;
+};
+
+KJ_TEST("kj::cp() invokes explicit constructor") {
+  {
+    // non-const copy
+    ExplicitCopy a;
+    auto aCopy = kj::cp(a);
+    (void)aCopy;
+  }
+
+  {
+    // const copy
+    const ExplicitCopy a;
+    auto aCopy = kj::cp(a);
+    (void)aCopy;
+  }
+}
+
+class ImplicitCopy {
+public:
+  ImplicitCopy() {}
+  ImplicitCopy(const ImplicitCopy& other) = default;
+  ImplicitCopy(ImplicitCopy&& other) = delete;
+};
+
+KJ_TEST("kj::cp() invokes implicit constructor") {
+  {
+    // non-const copy
+    ImplicitCopy a;
+    auto aCopy = kj::cp(a);
+    (void)aCopy;
+  }
+
+  {
+    // const copy
+    const ImplicitCopy a;
+    auto aCopy = kj::cp(a);
+    (void)aCopy;
+  }
 }
 
 }  // namespace
