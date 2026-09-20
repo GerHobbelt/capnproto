@@ -634,9 +634,21 @@ namespace {
                                      stringifyStackTrace(trace), '\n');
     }
   } else {
-    message = kj::str("*** std::terminate() called with no exception"
-                      "\nstack: ", stringifyStackTraceAddresses(trace),
-                                   stringifyStackTrace(trace), '\n');
+    // std::current_exception() only reports an exception that is "currently being handled". When
+    // terminate() is reached because an exception escaped a noexcept function, some ABIs -- the
+    // MSVC one in particular -- have not begun handling it yet, so nothing is reported here even
+    // though an exception is very much in flight. KJ tracks its own exceptions independently of
+    // the C++ runtime, so fall back to that rather than reporting nothing at all. Unlike a stack
+    // trace taken here, a kj::Exception names the throw site and carries its own trace, so this
+    // stays useful even when the binary has no symbols.
+    InFlightExceptionIterator iter;
+    KJ_IF_SOME(exception, iter.next()) {
+      message = kj::str("*** Fatal uncaught kj::Exception: ", exception, '\n');
+    } else {
+      message = kj::str("*** std::terminate() called with no exception"
+                        "\nstack: ", stringifyStackTraceAddresses(trace),
+                                     stringifyStackTrace(trace), '\n');
+    }
   }
 
   kj::FdOutputStream(STDERR_FILENO).write(message.asBytes());
@@ -743,6 +755,31 @@ void printStackTraceOnCrash() {
 #else
 namespace {
 
+StringPtr signalName(int signo) {
+#if defined(__GLIBC__)
+#if __GLIBC_PREREQ(2, 32)
+  const char* desc = sigdescr_np(signo);
+  if (desc != nullptr) return desc;
+#endif
+#endif
+
+#if defined(SIGRTMIN) && defined(SIGRTMAX)
+  // sigdescr_np() returns null for real-time signals. The number is already printed separately.
+  if (signo >= SIGRTMIN && signo <= SIGRTMAX) return "Real-time signal"_kjc;
+#endif
+
+  // Fallback for platforms which don't provide sigdescr_np().
+  switch (signo) {
+    case SIGSEGV: return "Segmentation fault"_kjc;
+    case SIGBUS: return "Bus error"_kjc;
+    case SIGFPE: return "Floating-point exception"_kjc;
+    case SIGABRT: return "Aborted"_kjc;
+    case SIGILL: return "Illegal instruction"_kjc;
+    case SIGSYS: return "Bad system call"_kjc;
+    default: return "Unknown signal"_kjc;
+  }
+}
+
 [[noreturn]] void crashHandler(int signo, siginfo_t* info, void* context) {
   void* traceSpace[32]{};
 
@@ -803,17 +840,41 @@ namespace {
   auto trace = getStackTrace(traceSpace, 2);
 #endif
 
-  auto message = kj::str("*** Received signal #", signo, ": ", strsignal(signo),
-                         "\nstack: ", stringifyStackTraceAddresses(trace),
-                         stringifyStackTrace(trace), '\n');
+  char addressBuffer[4096]{};
+  auto addresses = stringifyStackTraceAddresses(trace, addressBuffer);
 
-  FdOutputStream(STDERR_FILENO).write(message.asBytes());
+  char messageBuffer[sizeof(addressBuffer)+1024]{};
+  auto message = kj::strPreallocated(messageBuffer,
+      "*** Received signal #", signo, ": ", signalName(signo),
+      "\nstack: ", addresses, '\n');
+
+  // Do not use FdOutputStream here: its error handling can allocate and throw. write() itself is
+  // async-signal-safe.
+  const char* pos = message.begin();
+  size_t remaining = message.size();
+  while (remaining > 0) {
+    auto n = miniposix::write(STDERR_FILENO, pos, remaining);
+    if (n > 0) {
+      pos += n;
+      remaining -= n;
+    } else if (n < 0 && errno == EINTR) {
+      continue;
+    } else {
+      break;
+    }
+  }
   _exit(1);
 }
 
 }  // namespace
 
 void printStackTraceOnCrash() {
+  // getStackTrace() lazily initializes the root exception callback, and on glibc the first call to
+  // backtrace() dynamically loads libgcc. Both operations allocate memory, so do them before
+  // installing the signal handlers.
+  void* warmupSpace[1]{};
+  getStackTrace(warmupSpace, 0);
+
   // Set up alternate signal stack so that stack overflows can be handled.
   stack_t stack = {};
 
