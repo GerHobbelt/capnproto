@@ -37,6 +37,7 @@ cc_library(
     hdrs = [
         "arena.h",
         "array.h",
+        "atomic.h",
         "common.h",
         "debug.h",
         "encoding.h",
@@ -362,6 +363,17 @@ cc_test(
     tags = ["google_benchmark"],
     deps = [
         ":kj-async",
+        "@google_benchmark//:benchmark",
+    ],
+)
+
+cc_test(
+    name = "table-bench",
+    size = "large",
+    srcs = ["table-bench.c++"],
+    tags = ["google_benchmark"],
+    deps = [
+        ":kj-test",
         "@google_benchmark//:benchmark",
     ],
 )

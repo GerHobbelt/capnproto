@@ -171,49 +171,53 @@ size_t BrotliInputStream::tryRead(ArrayPtr<byte> out, size_t minBytes) {
 }
 
 size_t BrotliInputStream::readImpl(ArrayPtr<byte> out, size_t minBytes, size_t alreadyRead) {
-  // Ask for more input unless there is pending output
-  if (availableIn == 0 && !BrotliDecoderHasMoreOutput(ctx)) {
-    size_t amount = inner.tryRead(buffer, 1);
-    if (amount == 0) {
-      KJ_REQUIRE(atValidEndpoint, "brotli compressed stream ended prematurely");
-      return alreadyRead;
-    } else {
-      nextIn = buffer;
-      availableIn = amount;
+  for (;;) {
+    // Ask for more input unless there is pending output
+    if (availableIn == 0 && !BrotliDecoderHasMoreOutput(ctx)) {
+      size_t amount = inner.tryRead(buffer, 1);
+      if (amount == 0) {
+        KJ_REQUIRE(atValidEndpoint, "brotli compressed stream ended prematurely");
+        return alreadyRead;
+      } else {
+        nextIn = buffer;
+        availableIn = amount;
+      }
     }
-  }
 
-  byte* nextOut = out.begin();
-  size_t availableOut = out.size();
-  // Check window bits
-  if (firstInput && availableIn) {
-    firstInput = false;
-    int streamWbits = getBrotliWindowBits(nextIn[0]);
-    KJ_REQUIRE(streamWbits <= windowBits,
-        "brotli window size too big", (1 << streamWbits));
-  }
-  BrotliDecoderResult result = BrotliDecoderDecompressStream(
-      ctx, &availableIn, &nextIn, &availableOut, &nextOut, nullptr);
-  KJ_REQUIRE(result != BROTLI_DECODER_RESULT_ERROR, "brotli decompression failed",
-             BrotliDecoderErrorString(BrotliDecoderGetErrorCode(ctx)));
+    byte* nextOut = out.begin();
+    size_t availableOut = out.size();
+    // Check window bits
+    if (firstInput && availableIn) {
+      firstInput = false;
+      int streamWbits = getBrotliWindowBits(nextIn[0]);
+      KJ_REQUIRE(streamWbits <= windowBits,
+          "brotli window size too big", (1 << streamWbits));
+    }
+    BrotliDecoderResult result = BrotliDecoderDecompressStream(
+        ctx, &availableIn, &nextIn, &availableOut, &nextOut, nullptr);
+    KJ_REQUIRE(result != BROTLI_DECODER_RESULT_ERROR, "brotli decompression failed",
+               BrotliDecoderErrorString(BrotliDecoderGetErrorCode(ctx)));
 
-  atValidEndpoint = result == BROTLI_DECODER_RESULT_SUCCESS;
-  if (atValidEndpoint && availableIn > 0) {
-    // There's more data available. Assume start of new content.
-    // Not sure if we actually want this, but there is limited potential for breakage as arbitrary
-    // trailing data should still be rejected. Unfortunately this is kind of clunky as brotli does
-    // not support resetting an instance.
-    BrotliDecoderDestroyInstance(ctx);
-    ctx = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
-    KJ_REQUIRE(ctx, "brotli state allocation failed");
-    firstInput = true;
-  }
+    atValidEndpoint = result == BROTLI_DECODER_RESULT_SUCCESS;
+    if (atValidEndpoint && availableIn > 0) {
+      // There's more data available. Assume start of new content.
+      // Not sure if we actually want this, but there is limited potential for breakage as arbitrary
+      // trailing data should still be rejected. Unfortunately this is kind of clunky as brotli does
+      // not support resetting an instance.
+      BrotliDecoderDestroyInstance(ctx);
+      ctx = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
+      KJ_REQUIRE(ctx, "brotli state allocation failed");
+      firstInput = true;
+    }
 
-  size_t n = out.size() - availableOut;
-  if (n >= minBytes) {
-    return n + alreadyRead;
-  } else {
-    KJ_MUSTTAIL return readImpl(out.slice(n), minBytes - n, alreadyRead + n);
+    size_t n = out.size() - availableOut;
+    if (n >= minBytes) {
+      return n + alreadyRead;
+    }
+
+    out = out.slice(n);
+    minBytes -= n;
+    alreadyRead += n;
   }
 }
 
@@ -261,9 +265,66 @@ BrotliAsyncInputStream::~BrotliAsyncInputStream() noexcept(false) {
 }
 
 Promise<size_t> BrotliAsyncInputStream::tryRead(void* out, size_t minBytes, size_t maxBytes) {
-  if (maxBytes == 0) return constPromise<size_t, 0>();
+  if (maxBytes == 0) co_return 0;
+  readInProgress = true;
+  KJ_DEFER(readInProgress = false);
+  co_return co_await readImpl(reinterpret_cast<byte*>(out), minBytes, maxBytes, 0);
+}
 
-  return readImpl(reinterpret_cast<byte*>(out), minBytes, maxBytes, 0);
+Maybe<size_t> BrotliAsyncInputStream::tryReadSync(ArrayPtr<byte> out, size_t minBytes) {
+  if (out.size() == 0) return size_t(0);  // mirrors tryRead()
+  KJ_REQUIRE(!readInProgress, "concurrent read operations not allowed");
+  if (minBytes > 1) {
+    // If decompressing the buffered input were to produce more than zero but fewer than
+    // `minBytes` bytes, we would be stuck: we can neither return a short count (which would
+    // falsely signal EOF) nor undo the decompression. Since the output size of compressed data
+    // cannot be predicted, only accept reads that any nonzero amount of output can satisfy.
+    // (Performance-sensitive callers, like pump loops, use minBytes == 1.)
+    return kj::none;
+  }
+
+  while (availableIn > 0 || BrotliDecoderHasMoreOutput(ctx)) {
+    // Decompress from already-buffered compressed input, mirroring readImpl().
+    byte* nextOut = out.begin();
+    size_t availableOut = out.size();
+
+    // Check window bits
+    if (firstInput && availableIn) {
+      firstInput = false;
+      int streamWbits = getBrotliWindowBits(nextIn[0]);
+      KJ_REQUIRE(streamWbits <= windowBits,
+          "brotli window size too big", (1 << streamWbits));
+    }
+    BrotliDecoderResult result = BrotliDecoderDecompressStream(
+        ctx, &availableIn, &nextIn, &availableOut, &nextOut, nullptr);
+    // A synchronous read was possible, but the data is corrupt; throw just like the async path
+    // would have.
+    KJ_REQUIRE(result != BROTLI_DECODER_RESULT_ERROR, "brotli decompression failed",
+               BrotliDecoderErrorString(BrotliDecoderGetErrorCode(ctx)));
+
+    atValidEndpoint = result == BROTLI_DECODER_RESULT_SUCCESS;
+    if (atValidEndpoint && availableIn > 0) {
+      // There's more data available. Assume start of new content, as in readImpl().
+      BrotliDecoderDestroyInstance(ctx);
+      ctx = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
+      KJ_REQUIRE(ctx, "brotli state allocation failed");
+      firstInput = true;
+    }
+
+    size_t n = out.size() - availableOut;
+    if (n >= minBytes) {
+      return n;
+    }
+
+    // No output was produced (n == 0, since minBytes <= 1). If buffered input remains (e.g. we
+    // just reset at a stream boundary), try again; otherwise fall back to the async path.
+    //
+    // Note that having consumed buffered input without producing output is not an observable
+    // side effect: the decompressor retains that data internally, and a subsequent tryRead()
+    // will return exactly the same bytes it would have returned anyway.
+  }
+
+  return kj::none;
 }
 
 Promise<size_t> BrotliAsyncInputStream::readImpl(

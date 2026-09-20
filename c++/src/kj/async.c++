@@ -40,6 +40,7 @@
 #endif
 
 #include "async.h"
+#include "atomic.h"
 #include "debug.h"
 #include "vector.h"
 #include "mutex.h"
@@ -47,8 +48,8 @@
 #include "function.h"
 #include "list.h"
 #include "map.h"
-#include <deque>
 #include <atomic>
+#include <deque>
 
 #if __linux__
 #include <sys/prctl.h>
@@ -93,27 +94,6 @@
 // Nop the hints so that we don't have to put #ifdefs around every use.
 #define __sanitizer_start_switch_fiber(...)
 #define __sanitizer_finish_switch_fiber(...)
-#endif
-
-#if _MSC_VER && !__clang__
-// MSVC's atomic intrinsics are weird and different, whereas the C++ standard atomics match the GCC
-// builtins -- except for requiring the obnoxious std::atomic<T> wrapper. So, on MSVC let's just
-// #define the builtins based on the C++ library, reinterpret-casting native types to
-// std::atomic... this is cheating but ugh, whatever.
-template <typename T>
-static std::atomic<T>* reinterpretAtomic(T* ptr) { return reinterpret_cast<std::atomic<T>*>(ptr); }
-#define __atomic_store_n(ptr, val, order) \
-    std::atomic_store_explicit(reinterpretAtomic(ptr), val, order)
-#define __atomic_load_n(ptr, order) \
-    std::atomic_load_explicit(reinterpretAtomic(ptr), order)
-#define __atomic_compare_exchange_n(ptr, expected, desired, weak, succ, fail) \
-    std::atomic_compare_exchange_strong_explicit( \
-        reinterpretAtomic(ptr), expected, desired, succ, fail)
-#define __atomic_exchange_n(ptr, val, order) \
-    std::atomic_exchange_explicit(reinterpretAtomic(ptr), val, order)
-#define __ATOMIC_RELAXED std::memory_order_relaxed
-#define __ATOMIC_ACQUIRE std::memory_order_acquire
-#define __ATOMIC_RELEASE std::memory_order_release
 #endif
 
 namespace kj {
@@ -598,7 +578,7 @@ public:
 #if USE_CORE_LOCAL_FREELISTS
     KJ_IF_SOME(core, lookupCoreLocalFreelist()) {
       for (auto& stackPtr: core.stacks) {
-        _::FiberStack* result = __atomic_exchange_n(&stackPtr, nullptr, __ATOMIC_ACQUIRE);
+        _::FiberStack* result = kj::atomicExchange(&stackPtr, nullptr, kj::AtomicMemoryOrder::ACQUIRE);
         if (result != nullptr) {
           // Found a stack in this slot!
           return { result, *this };
@@ -673,7 +653,7 @@ private:
 #if USE_CORE_LOCAL_FREELISTS
       KJ_IF_SOME(core, lookupCoreLocalFreelist()) {
         for (auto& stackPtr: core.stacks) {
-          stack = __atomic_exchange_n(&stackPtr, stack, __ATOMIC_RELEASE);
+          stack = kj::atomicExchange(&stackPtr, stack, kj::AtomicMemoryOrder::RELEASE);
           if (stack == nullptr) {
             // Cool, we inserted the stack into an unused slot. We're done.
             return;
@@ -795,7 +775,8 @@ struct Executor::Impl {
 
       for (auto& event: fulfilled) {
         fulfilled.remove(event);
-        event.control->state = _::XThreadPafControl::DISPATCHED;
+        kj::atomicStore(&event.control->state, _::XThreadPafControl::DISPATCHED,
+            kj::AtomicMemoryOrder::RELEASE);
         event.onReadyEvent.armBreadthFirst();
       }
     }
@@ -890,7 +871,8 @@ struct Executor::Impl {
       KJ_LOG(ERROR, "EventLoop destroyed with cross-thread fulfiller replies outstanding");
       for (auto& event: s.fulfilled) {
         s.fulfilled.remove(event);
-        event.control->state = _::XThreadPafControl::DISPATCHED;
+        kj::atomicStore(&event.control->state, _::XThreadPafControl::DISPATCHED,
+            kj::AtomicMemoryOrder::RELEASE);
       }
     }
   }};
@@ -909,7 +891,7 @@ void XThreadEvent::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
 }
 
 void XThreadEvent::ensureDoneOrCanceled() {
-  if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) != DONE) {
+  if (kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) != DONE) {
     auto lock = targetExecutor->impl->state.lockExclusive();
 
     const EventLoop* loop;
@@ -918,7 +900,9 @@ void XThreadEvent::ensureDoneOrCanceled() {
     } else {
       // Target event loop is already dead, so we know it's already working on transitioning all
       // events to the DONE state. We can just wait.
-      lock.wait([&](auto&) { return state == DONE; });
+      lock.wait([&](auto&) {
+        return kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) == DONE;
+      });
       return;
     }
 
@@ -973,7 +957,7 @@ void XThreadEvent::ensureDoneOrCanceled() {
             // after this scope.
           });
 
-          while (state != DONE) {
+          while (kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) != DONE) {
             bool otherThreadIsWaiting = lock->waitingForCancel;
 
             // Make sure our waitingForCancel is on and dispatch any pending cancellations on this
@@ -1012,7 +996,8 @@ void XThreadEvent::ensureDoneOrCanceled() {
             // OK, now we can wait for the other thread to either process our cancellation or
             // indicate that it is waiting for remote cancellation.
             lock.wait([&](const Executor::Impl::State& executorState) {
-              return state == DONE || executorState.waitingForCancel;
+              return kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) == DONE ||
+                  executorState.waitingForCancel;
             });
           }
         } else {
@@ -1021,7 +1006,9 @@ void XThreadEvent::ensureDoneOrCanceled() {
           //
           // NOTE: I don't think we can actually get here, because it implies that this is a
           //   synchronous execution, which means there's no way to cancel it.
-          lock.wait([&](auto&) { return state == DONE; });
+          lock.wait([&](auto&) {
+            return kj::atomicLoad(&state, kj::AtomicMemoryOrder::ACQUIRE) == DONE;
+          });
         }
         KJ_DASSERT(!targetLink.isLinked());
         break;
@@ -1104,7 +1091,7 @@ void XThreadEvent::done() {
 }
 
 inline void XThreadEvent::setDoneState() {
-  __atomic_store_n(&state, DONE, __ATOMIC_RELEASE);
+  kj::atomicStore(&state, DONE, kj::AtomicMemoryOrder::RELEASE);
 }
 
 void XThreadEvent::setDisconnected() {
@@ -1155,22 +1142,26 @@ XThreadPaf::~XThreadPaf() noexcept(false) {}
 void XThreadPaf::destroy() {
   auto oldState = XThreadPafControl::WAITING;
 
-  if (__atomic_load_n(&control->state, __ATOMIC_ACQUIRE) == XThreadPafControl::DISPATCHED) {
+  if (kj::atomicLoad(&control->state, kj::AtomicMemoryOrder::ACQUIRE) == XThreadPafControl::DISPATCHED) {
     // Common case: Promise was fully fulfilled and dispatched, no need for locking.
     delete this;
-  } else if (__atomic_compare_exchange_n(
+  } else if (kj::atomicCompareExchange(
                  &control->state, &oldState, XThreadPafControl::CANCELED, false,
-                 __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+                 kj::AtomicMemoryOrder::ACQUIRE_RELEASE,
+                 kj::AtomicMemoryOrder::ACQUIRE)) {
     // State transitioned from WAITING to CANCELED, so now it's the fulfiller's job to destroy the
-    // object.
+    // object. The successful CAS must have release semantics, not merely acquire semantics: this
+    // publishes this thread's preceding accesses to the object (including the virtual destroy()
+    // dispatch) before the fulfiller observes CANCELED and deletes the object.
   } else {
     // Whoops, another thread is already in the process of fulfilling this promise. We'll have to
     // wait for it to finish and transition the state to FULFILLED.
     executor->impl->state.when([&](auto&) {
-      return control->state == XThreadPafControl::FULFILLED ||
-          control->state == XThreadPafControl::DISPATCHED;
+      auto state = kj::atomicLoad(&control->state, kj::AtomicMemoryOrder::ACQUIRE);
+      return state == XThreadPafControl::FULFILLED || state == XThreadPafControl::DISPATCHED;
     }, [&](Executor::Impl::State& exState) {
-      if (control->state == XThreadPafControl::FULFILLED) {
+      if (kj::atomicLoad(&control->state, kj::AtomicMemoryOrder::ACQUIRE) ==
+          XThreadPafControl::FULFILLED) {
         // The object is on the queue but was not yet dispatched. Remove it.
         exState.fulfilled.remove(*this);
       }
@@ -1193,13 +1184,13 @@ void XThreadPaf::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
 }
 
 XThreadPaf::FulfillScope::FulfillScope(XThreadPaf** pointer) {
-  obj = __atomic_exchange_n(pointer, static_cast<XThreadPaf*>(nullptr), __ATOMIC_ACQUIRE);
+  obj = kj::atomicExchange(pointer, static_cast<XThreadPaf*>(nullptr), kj::AtomicMemoryOrder::ACQUIRE);
   auto oldState = XThreadPafControl::WAITING;
   if (obj == nullptr) {
     // Already fulfilled (possibly by another thread).
-  } else if (__atomic_compare_exchange_n(
+  } else if (kj::atomicCompareExchange(
                  &obj->control->state, &oldState, XThreadPafControl::FULFILLING, false,
-                 __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+                 kj::AtomicMemoryOrder::ACQUIRE, kj::AtomicMemoryOrder::ACQUIRE)) {
     // Transitioned to FULFILLING, good.
   } else {
     // The waiting thread must have canceled.
@@ -1216,7 +1207,7 @@ XThreadPaf::FulfillScope::~FulfillScope() noexcept(false) {
   if (obj != nullptr) {
     auto lock = obj->executor->impl->state.lockExclusive();
     lock->fulfilled.add(*obj);
-    __atomic_store_n(&obj->control->state, XThreadPafControl::FULFILLED, __ATOMIC_RELEASE);
+    kj::atomicStore(&obj->control->state, XThreadPafControl::FULFILLED, kj::AtomicMemoryOrder::RELEASE);
     KJ_IF_SOME(l, lock->loop) {
       // TODO(perf): It's annoying we have to call wake() with the lock held, but we have to
       //   prevent the destination EventLoop from being destroyed first.
@@ -1542,7 +1533,8 @@ FiberStack::FiberStack(size_t stackSizeParam)
 
   makecontext(&context, reinterpret_cast<void(*)()>(&StartRoutine::run), 2, arg1, arg2);
 
-  __sanitizer_start_switch_fiber(&impl->originalFakeStack, impl, stackSize - sizeof(Impl));
+  __sanitizer_start_switch_fiber(&impl->originalFakeStack,
+      reinterpret_cast<byte*>(impl + 1) - stackSize, stackSize - sizeof(Impl));
   if (_setjmp(impl->originalJmpBuf) == 0) {
     setcontext(&context);
   }
@@ -1639,7 +1631,8 @@ void FiberStack::switchToFiber() {
 #if _WIN32 || __CYGWIN__
   SwitchToFiber(osFiber);
 #else
-  __sanitizer_start_switch_fiber(&impl->originalFakeStack, impl, stackSize - sizeof(Impl));
+  __sanitizer_start_switch_fiber(&impl->originalFakeStack,
+      reinterpret_cast<byte*>(impl + 1) - stackSize, stackSize - sizeof(Impl));
   if (_setjmp(impl->originalJmpBuf) == 0) {
     _longjmp(impl->fiberJmpBuf, 1);
   }
@@ -3072,6 +3065,10 @@ CoroutineBase::~CoroutineBase() noexcept(false) {
   readMaybe(maybeDisposalResults)->destructorRan = true;
 }
 
+bool UnwindAwareCoroutineBase::isUnwinding() const {
+  return UnwindDetector::uncaughtExceptionCount() > uncaughtCountAtEntry;
+}
+
 void CoroutineBase::unhandledExceptionImpl(ExceptionOrValue& resultRef) {
   // Pretty self-explanatory, we propagate the exception to the promise which owns us, unless
   // we're being destroyed, in which case we propagate it back to our disposer. Note that all
@@ -3128,6 +3125,11 @@ void CoroutineBase::fire() {
   // try-catch block, so we have no choice but to resume and throw later.
 
   coroutine.resume();
+}
+
+void UnwindAwareCoroutineBase::fire() {
+  uncaughtCountAtEntry = UnwindDetector::uncaughtExceptionCount();
+  CoroutineBase::fire();
 }
 
 void CoroutineBase::traceEvent(TraceBuilder& builder) {

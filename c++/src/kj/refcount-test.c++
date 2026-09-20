@@ -22,7 +22,11 @@
 #include "refcount.h"
 #include "array.h"
 #include "string.h"
+#include "thread.h"
 #include <kj/compat/gtest.h>
+
+#include <atomic>
+#include <thread>
 
 namespace kj {
 
@@ -45,6 +49,16 @@ static_assert(Cloneable<Array<Rc<SetTrueInDestructor>>>);
 static_assert(!Cloneable<const Array<Rc<SetTrueInDestructor>>>);
 static_assert(Cloneable<ArrayPtr<Rc<SetTrueInDestructor>>>);
 static_assert(!Cloneable<const ArrayPtr<Rc<SetTrueInDestructor>>>);
+
+struct WeakInConstructor: public Refcounted {
+  // Captures a weak reference to itself from within its constructor, exercising addWeakToThis()
+  // before kj::rc()/kj::refcounted() has incremented the refcount.
+  WeakInConstructor(bool* ptr): ptr(ptr), weak(addWeakToThis()) {}
+  ~WeakInConstructor() { *ptr = true; }
+
+  bool* ptr;
+  kj::WeakRc<WeakInConstructor> weak;
+};
 
 struct IncompleteDeclaredRefcounted;
 static_assert(sizeof(Rc<IncompleteDeclaredRefcounted>) == 2 * sizeof(void*));
@@ -165,9 +179,76 @@ TEST(Refcount, Basic) {
 
 #ifdef KJ_DEBUG
   b = false;
-  SetTrueInDestructor obj(&b);
-  EXPECT_ANY_THROW(addRef(obj));
+  // A Refcounted object is born with refcount == 1 and must be adopted by the Own/Rc returned from
+  // kj::refcounted()/kj::rc(). Allocating one another way (e.g. on the stack) and destroying it
+  // trips the destructor's refcount assertion, since the count never returns to zero via disposal.
+  EXPECT_ANY_THROW(SetTrueInDestructor obj(&b));
 #endif
+}
+
+struct InlineRefcounted {
+  // Holds a Refcounted object inline as a member, an allocation the destructor should reject.
+  InlineRefcounted(bool* ptr): inner(ptr) {}
+  SetTrueInDestructor inner;
+};
+
+#ifdef KJ_DEBUG
+KJ_TEST("Refcounted rejects stack/inline allocation") {
+  // A Refcounted object is born with refcount == 1 and only reaches its destructor with refcount 0
+  // after being adopted by (and disposed through) an Own<T>/Rc<T>. Allocating it any other way
+  // leaves the initial reference stranded, so destruction trips the assertion. This assertion is
+  // KJ_DASSERT (debug-only), so this test only runs under KJ_DEBUG.
+
+  bool b = false;
+
+  // Directly on the stack.
+  KJ_EXPECT_THROW_MESSAGE("Refcounted object deleted with non-zero refcount", SetTrueInDestructor obj(&b));
+
+  // Inline as a member of another object.
+  KJ_EXPECT_THROW_MESSAGE("Refcounted object deleted with non-zero refcount", InlineRefcounted obj(&b));
+
+  // On the heap via plain `new`/`delete` rather than kj::refcounted(). The initial reference is
+  // still stranded, so deleting it (which invokes ~Refcounted() with refcount == 1, and not during
+  // an unwind) trips the assertion.
+  KJ_EXPECT_THROW_MESSAGE("Refcounted object deleted with non-zero refcount",
+      delete new SetTrueInDestructor(&b));
+}
+#endif
+
+struct ThrowInConstructor: public Refcounted {
+  // Throws from its constructor body, after the Refcounted base subobject has been fully
+  // constructed (with refcount == 1). During the resulting stack unwind, ~Refcounted() runs while
+  // refcount is still non-zero; the destructor's assertion must NOT fire spuriously in this case,
+  // because we are unwinding due to an exception rather than leaking a stranded reference.
+  ThrowInConstructor() {
+    KJ_FAIL_ASSERT("throw from Refcounted constructor");
+  }
+};
+
+KJ_TEST("Refcounted constructor that throws does not trip destructor assertion") {
+  // The exception that propagates must be the constructor's, not a secondary failure from the
+  // destructor's refcount assertion (which, if it fired while already unwinding, would terminate).
+  KJ_EXPECT_THROW_MESSAGE("throw from Refcounted constructor",
+      kj::refcounted<ThrowInConstructor>());
+}
+
+struct ThrowAfterPublishingWeak: public Refcounted {
+  ThrowAfterPublishingWeak(WeakRc<ThrowAfterPublishingWeak>& published) {
+    published = addWeakToThis();
+    KJ_FAIL_ASSERT("throw after publishing weak reference");
+  }
+};
+
+KJ_TEST("WeakRc published by throwing constructor expires") {
+  WeakRc<ThrowAfterPublishingWeak> weak = nullptr;
+
+  KJ_EXPECT_THROW_MESSAGE("throw after publishing weak reference",
+      kj::rc<ThrowAfterPublishingWeak>(weak));
+
+  // A failed construction has ended the referent's lifetime, so the published weak reference must
+  // not retain the stale pointer or attempt to read the freed Refcounted object while upgrading.
+  KJ_EXPECT(weak == nullptr);
+  KJ_EXPECT(weak.upgrade() == kj::none);
 }
 
 KJ_TEST("Rc") {
@@ -287,6 +368,24 @@ KJ_TEST("Rc Own interop") {
     EXPECT_TRUE(b);
 }
 
+KJ_TEST("Rc disown / reown") {
+  bool b = false;
+  SetTrueInDestructor* ptr = nullptr;
+
+  {
+    Rc<SetTrueInDestructor> ref = kj::rc<SetTrueInDestructor>(&b);
+    ptr = ref.disown();
+  }
+
+  KJ_EXPECT(b == false);
+
+  {
+    auto ref = kj::Rc<SetTrueInDestructor>::reown(ptr);
+  }
+
+  KJ_EXPECT(b == true);
+}
+
 KJ_TEST("Rc wraps Own of refcounted types") {
   bool b = false;
 
@@ -367,15 +466,15 @@ KJ_TEST("Rc wraps attached Own") {
   bool b = false;
   bool attached = false;
 
-  Own<SetTrueInDestructor> own = kj::refcounted<SetTrueInDestructor>(&b)
-      .attachToThisReference(kj::heap<SetTrueInDestructor2>(&attached));
-  Rc<SetTrueInDestructor> ref(kj::mv(own));
+  Own<SetTrueInDestructor2> own = kj::heap<SetTrueInDestructor2>(&b)
+      .attach(kj::heap<SetTrueInDestructor2>(&attached));
+  Rc<SetTrueInDestructor2> ref(kj::mv(own));
   EXPECT_TRUE(own.get() == nullptr);
   EXPECT_TRUE(ref != nullptr);
   EXPECT_FALSE(b);
   EXPECT_FALSE(attached);
 
-  Rc<SetTrueInDestructor> ref2 = ref.addRef();
+  Rc<SetTrueInDestructor2> ref2 = ref.addRef();
 
   ref = nullptr;
   EXPECT_FALSE(b);
@@ -418,39 +517,6 @@ struct Concrete final: public Abstract {
   void use() override {}
   bool* ptr;
 };
-
-struct AbstractRefcounted: public Refcounted {
-  virtual void use() = 0;
-};
-
-struct ConcreteRefcounted final: public Abstract, public AbstractRefcounted {
-  ConcreteRefcounted(bool* ptr): ptr(ptr) {}
-  ~ConcreteRefcounted() { *ptr = true; }
-  void use() override {}
-
-  bool* ptr;
-};
-
-KJ_TEST("Rc wraps Own of abstract refcounted types") {
-  bool b = false;
-
-  Own<AbstractRefcounted> own = kj::refcounted<ConcreteRefcounted>(&b);
-
-  Rc<AbstractRefcounted> ref(kj::mv(own));
-  EXPECT_TRUE(own.get() == nullptr);
-  EXPECT_TRUE(ref != nullptr);
-
-  ref->use();
-
-  Rc<AbstractRefcounted> ref2 = ref.addRef();
-  EXPECT_TRUE(ref.get() == ref2.get());
-
-  ref = nullptr;
-  EXPECT_FALSE(b);
-
-  ref2 = nullptr;
-  EXPECT_TRUE(b);
-}
 
 KJ_TEST("Rc<Abstract>") {
   bool b = false;
@@ -886,6 +952,30 @@ KJ_TEST("Refcounted::addWeakToThis") {
   EXPECT_TRUE(weak == nullptr);
 }
 
+KJ_TEST("Refcounted::addWeakToThis in constructor") {
+  bool b = false;
+
+  auto ref = kj::rc<WeakInConstructor>(&b);
+
+  // The weak reference captured during construction is valid and refers to the object.
+  EXPECT_TRUE(ref->weak == ref);
+  EXPECT_FALSE(ref->isShared());
+
+  KJ_IF_SOME(strong, ref->weak.upgrade()) {
+    EXPECT_TRUE(strong == ref);
+  } else {
+    KJ_FAIL_EXPECT("expected WeakRc captured in constructor to upgrade while referent is alive");
+  }
+
+  // Grab an independent weak reference before dropping the object; it must observe expiration once
+  // the last strong reference is gone.
+  WeakRc<WeakInConstructor> weak = ref->weak.clone();
+
+  ref = nullptr;
+  EXPECT_TRUE(b);
+  EXPECT_TRUE(weak == nullptr);
+}
+
 KJ_TEST("RefcountedWrapper") {
   {
     bool b = false;
@@ -1136,6 +1226,48 @@ KJ_TEST("Arc inheritance") {
   EXPECT_FALSE(b);
   down = nullptr;
   EXPECT_TRUE(b);
+}
+
+KJ_TEST("atomicAddRef is safe under concurrent reference-count changes") {
+  bool destroyed = false;
+  auto owner = kj::atomicRefcounted<AtomicSetTrueInDestructor>(&destroyed);
+  auto* object = owner.get();
+  std::atomic<bool> start(false);
+
+  auto addRefs = [&]() noexcept {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (uint i = 0; i < 1000; ++i) {
+      auto ref = kj::atomicAddRef(*object);
+    }
+  };
+
+  kj::Thread thread1(addRefs);
+  kj::Thread thread2(addRefs);
+  start.store(true, std::memory_order_release);
+}
+
+KJ_TEST("Arc concurrent final release is synchronized") {
+  bool destroyed = false;
+  auto ref1 = kj::arc<AtomicSetTrueInDestructor>(&destroyed);
+  auto ref2 = ref1.addRef();
+  std::atomic<bool> start(false);
+
+  kj::Thread thread1([ref = kj::mv(ref1), &start]() mutable noexcept {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    ref = nullptr;
+  });
+  kj::Thread thread2([ref = kj::mv(ref2), &start]() mutable noexcept {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    ref = nullptr;
+  });
+
+  start.store(true, std::memory_order_release);
 }
 
 KJ_TEST("AtomicRefcounted::addRefToThis") {

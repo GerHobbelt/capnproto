@@ -22,10 +22,7 @@
 #pragma once
 
 #include "memory.h"
-
-#if _MSC_VER && !defined(__clang__)
-#include <intrin0.h> // _InterlockedXX
-#endif
+#include "atomic.h"
 
 KJ_BEGIN_HEADER
 
@@ -120,7 +117,11 @@ protected:
   }
 
 private:
-  mutable uint refcount = 0;
+  mutable uint refcount = 1;
+  // A Refcounted object is born with a reference count of 1: it always comes into existence owned
+  // by exactly one strong reference (the Own<T>/Rc<T> returned by kj::refcounted()/kj::rc()). This
+  // means the object is in a valid, fully-counted state throughout its constructor, so addRefToThis()
+  // and addWeakToThis() may be called from within the constructor.
   // "mutable" because disposeImpl() is const.  Bleh.
 
   mutable _::RcWeakCell* weakCell = nullptr;
@@ -172,8 +173,8 @@ template <typename T, typename... Params>
 inline Own<T> refcounted(Params&&... params) {
   // Allocate a new refcounted instance of T, passing `params` to its constructor.  Returns an
   // initial reference to the object.  More references can be created with `kj::addRef()`.
-
-  return Refcounted::addRefInternal(new T(kj::fwd<Params>(params)...));
+  T* object = new T(kj::fwd<Params>(params)...);
+  return Own<T>(object, *static_cast<Refcounted*>(object));
 }
 
 template <typename T>
@@ -207,7 +208,7 @@ template <typename T>
 class RcWrapper final: public Refcounted {
 public:
   template <typename... Params>
-  explicit RcWrapper(Params &&...params) : wrapped(kj::fwd<Params>(params)...) { ++refcount; }
+  explicit RcWrapper(Params &&...params) : wrapped(kj::fwd<Params>(params)...) {}
   T* getWrappedPtr() { return &wrapped; }
   const T *getWrappedPtr() const { return &wrapped; }
 
@@ -218,7 +219,7 @@ private:
 template <typename T>
 class RcOwnWrapper final: public Refcounted {
 public:
-  explicit RcOwnWrapper(Own<T> &&wrapped) : wrapped(kj::mv(wrapped)) { ++refcount; }
+  explicit RcOwnWrapper(Own<T> &&wrapped) : wrapped(kj::mv(wrapped)) {}
   T* getWrappedPtr() { return wrapped.get(); }
   const T *getWrappedPtr() const { return wrapped.get(); }
 
@@ -313,6 +314,23 @@ public:
     return addRef();
   }
 
+  // Surrenders ownership of the underlying object to the caller. Unlike Own<T>::disown(), there
+  // is no need for the caller to prove they know how to dispose of the object, because the object
+  // is its own Disposer.
+  T* disown() {
+    static_assert(canConvert<T*, Refcounted*>());
+    T* result = ptr;
+    refcounted = nullptr;
+    ptr = nullptr;
+    return result;
+  }
+
+  // Assume ownership of an object without incrementing its refcount. Opposite of disown().
+  static Rc reown(T* ptr) {
+    static_assert(canConvert<T*, Refcounted*>());
+    return Rc(static_cast<Refcounted*>(ptr), ptr);
+  }
+
   WeakRc<T> downgrade();
   // Create a weak reference to the referent. The weak reference does not keep the object alive;
   // it expires once the last strong Rc<T> is dropped, but can be upgraded back to an Rc<T> while
@@ -385,7 +403,8 @@ inline Rc<T> rc(Params&&... params) {
   // Returns smart pointer that can be used to manage references.
 
   if constexpr (canConvert<T*, Refcounted*>()) {
-    return Refcounted::addRcRefInternal(new T(fwd<Params>(params)...));
+    T* object = new T(fwd<Params>(params)...);
+    return Rc<T>(static_cast<Refcounted*>(object), object);
   } else {
     auto wrapper = new _::RcWrapper<T>(fwd<Params>(params)...);
     return Rc<T>(wrapper, wrapper->getWrappedPtr());
@@ -617,14 +636,6 @@ Own<RefcountedWrapper<Own<T>>> refcountedWrapper(Own<T>&& wrapped) {
 //
 // Warning: Atomic ops are SLOW.
 
-#if _MSC_VER && !defined(__clang__)
-#if _M_ARM
-#define KJ_MSVC_INTERLOCKED(OP, MEM) _Interlocked##OP##_##MEM
-#else
-#define KJ_MSVC_INTERLOCKED(OP, MEM) _Interlocked##OP
-#endif
-#endif
-
 template<typename T>
 class Arc;
 
@@ -645,11 +656,7 @@ public:
   KJ_DISALLOW_COPY_AND_MOVE(AtomicRefcounted);
 
   inline bool isShared() const {
-#if _MSC_VER && !defined(__clang__)
-    return KJ_MSVC_INTERLOCKED(Or, acq)(&refcount, 0) > 1;
-#else
-    return __atomic_load_n(&refcount, __ATOMIC_ACQUIRE) > 1;
-#endif
+    return kj::atomicLoad(&refcount, kj::AtomicMemoryOrder::ACQUIRE) > 1;
   }
 
 protected:
@@ -658,20 +665,16 @@ protected:
   }
 
 private:
-#if _MSC_VER && !defined(__clang__)
-  mutable volatile long refcount = 0;
-#else
   mutable volatile uint refcount = 0;
-#endif
 
   bool addRefWeakInternal() const;
 
+  inline bool hasRefs() const {
+    return kj::atomicLoad(&refcount, kj::AtomicMemoryOrder::RELAXED) > 0;
+  }
+
   inline void incRefcount() const {
-#if _MSC_VER && !defined(__clang__)
-    KJ_MSVC_INTERLOCKED(Increment, nf)(&refcount);
-#else
-    __atomic_add_fetch(&refcount, 1, __ATOMIC_RELAXED);
-#endif
+    kj::atomicAddFetch(&refcount, 1, kj::AtomicMemoryOrder::RELAXED);
   }
 
   void disposeImpl(void* pointer) const override;
@@ -707,14 +710,14 @@ inline kj::Own<T> atomicRefcounted(Params&&... params) {
 
 template <typename T>
 kj::Own<T> atomicAddRef(T& object) {
-  KJ_IREQUIRE(object.AtomicRefcounted::refcount > 0,
+  KJ_IREQUIRE(object.AtomicRefcounted::hasRefs(),
       "Object not allocated with kj::atomicRefcounted().");
   return AtomicRefcounted::addRefInternal(&object);
 }
 
 template <typename T>
 kj::Own<const T> atomicAddRef(const T& object) {
-  KJ_IREQUIRE(object.AtomicRefcounted::refcount > 0,
+  KJ_IREQUIRE(object.AtomicRefcounted::hasRefs(),
       "Object not allocated with kj::atomicRefcounted().");
   return AtomicRefcounted::addRefInternal(&object);
 }
