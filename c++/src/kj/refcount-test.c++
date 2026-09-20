@@ -32,6 +32,7 @@ struct SetTrueInDestructor: public Refcounted {
   ~SetTrueInDestructor() { *ptr = true; }
 
   kj::Rc<SetTrueInDestructor> newRef() { return addRefToThis(); }
+  kj::WeakRc<SetTrueInDestructor> newWeakRef() { return addWeakToThis(); }
 
   bool* ptr;
 };
@@ -606,6 +607,46 @@ KJ_TEST("WeakRc KJ_IF_SOME and tryGet") {
   }
 }
 
+KJ_TEST("WeakRc KJ_REQUIRE_NONNULL") {
+  bool b = false;
+  auto ref = kj::rc<SetTrueInDestructor>(&b);
+  auto weak = ref.downgrade();
+
+  {
+    kj::Rc<SetTrueInDestructor> strong = KJ_REQUIRE_NONNULL(weak);
+    EXPECT_TRUE(strong == ref);
+  }
+
+  ref = nullptr;
+  EXPECT_TRUE(b);
+  EXPECT_TRUE(weak == nullptr);
+
+#if defined(KJ_ENABLE_IREQUIRE) && KJ_ENABLE_IREQUIRE
+  KJ_EXPECT_THROW_MESSAGE("weak != nullptr", (void)KJ_REQUIRE_NONNULL(weak));
+#endif
+}
+
+KJ_TEST("WeakRc const readMaybe integration") {
+  bool b = false;
+  auto ref = kj::rc<SetTrueInDestructor>(&b);
+
+  // readMaybe (and thus KJ_IF_SOME / KJ_REQUIRE_NONNULL) must work on a const WeakRc<T> even
+  // though T itself is non-const.
+  const WeakRc<SetTrueInDestructor> weak = ref.downgrade();
+
+  KJ_IF_SOME(strong, weak) {
+    static_assert(kj::isSameType<decltype(strong), kj::Rc<SetTrueInDestructor>&>());
+    EXPECT_TRUE(strong == ref);
+  } else {
+    KJ_FAIL_EXPECT("expected KJ_IF_SOME on const WeakRc to upgrade");
+  }
+
+  {
+    kj::Rc<SetTrueInDestructor> strong = KJ_REQUIRE_NONNULL(weak);
+    EXPECT_TRUE(strong == ref);
+  }
+}
+
 KJ_TEST("WeakRc expires when Rc dropped, observed through Maybe") {
   bool b = false;
   kj::Maybe<WeakRc<SetTrueInDestructor>> maybeWeak;
@@ -820,6 +861,29 @@ KJ_TEST("Refcounted::addRefToThis") {
 
   ref2 = nullptr;
   EXPECT_TRUE(b);
+}
+
+KJ_TEST("Refcounted::addWeakToThis") {
+  bool b = false;
+
+  auto ref = kj::rc<SetTrueInDestructor>(&b);
+  WeakRc<SetTrueInDestructor> weak = ref->newWeakRef();
+  EXPECT_TRUE(weak == ref);
+
+  // A weak reference created from `this` does not keep the object alive.
+  EXPECT_FALSE(ref->isShared());
+
+  KJ_IF_SOME(strong, weak.upgrade()) {
+    EXPECT_TRUE(strong == ref);
+    EXPECT_TRUE(ref->isShared());
+  } else {
+    KJ_FAIL_EXPECT("expected WeakRc to upgrade while referent is alive");
+  }
+
+  EXPECT_FALSE(ref->isShared());
+  ref = nullptr;
+  EXPECT_TRUE(b);
+  EXPECT_TRUE(weak == nullptr);
 }
 
 KJ_TEST("RefcountedWrapper") {

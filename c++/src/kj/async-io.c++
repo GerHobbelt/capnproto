@@ -1553,7 +1553,7 @@ private:
 
 class PipeReadEnd final: public AsyncInputStream {
 public:
-  PipeReadEnd(kj::Own<AsyncPipe> pipe): pipe(kj::mv(pipe)) {}
+  PipeReadEnd(kj::Rc<AsyncPipe> pipe): pipe(kj::mv(pipe)) {}
   ~PipeReadEnd() noexcept(false) {
     unwind.catchExceptionsIfUnwinding([&]() {
       pipe->abortRead();
@@ -1569,13 +1569,13 @@ public:
   }
 
 private:
-  Own<AsyncPipe> pipe;
+  Rc<AsyncPipe> pipe;
   UnwindDetector unwind;
 };
 
 class PipeWriteEnd final: public AsyncOutputStream {
 public:
-  PipeWriteEnd(kj::Own<AsyncPipe> pipe): pipe(kj::mv(pipe)) {}
+  PipeWriteEnd(kj::Rc<AsyncPipe> pipe): pipe(kj::mv(pipe)) {}
   ~PipeWriteEnd() noexcept(false) {
     unwind.catchExceptionsIfUnwinding([&]() {
       pipe->shutdownWrite();
@@ -1600,13 +1600,13 @@ public:
   }
 
 private:
-  Own<AsyncPipe> pipe;
+  Rc<AsyncPipe> pipe;
   UnwindDetector unwind;
 };
 
 class TwoWayPipeEnd final: public AsyncCapabilityStream {
 public:
-  TwoWayPipeEnd(kj::Own<AsyncPipe> in, kj::Own<AsyncPipe> out)
+  TwoWayPipeEnd(kj::Rc<AsyncPipe> in, kj::Rc<AsyncPipe> out)
       : in(kj::mv(in)), out(kj::mv(out)) {}
   ~TwoWayPipeEnd() noexcept(false) {
     unwind.catchExceptionsIfUnwinding([&]() {
@@ -1662,8 +1662,8 @@ public:
   }
 
 private:
-  kj::Own<AsyncPipe> in;
-  kj::Own<AsyncPipe> out;
+  kj::Rc<AsyncPipe> in;
+  kj::Rc<AsyncPipe> out;
   UnwindDetector unwind;
 };
 
@@ -1718,8 +1718,8 @@ private:
 }  // namespace
 
 OneWayPipe newOneWayPipe(kj::Maybe<uint64_t> expectedLength) {
-  auto impl = kj::refcounted<AsyncPipe>();
-  Own<AsyncInputStream> readEnd = kj::heap<PipeReadEnd>(kj::addRef(*impl));
+  auto impl = kj::rc<AsyncPipe>();
+  Own<AsyncInputStream> readEnd = kj::heap<PipeReadEnd>(impl.addRef());
   KJ_IF_SOME(l, expectedLength) {
     readEnd = kj::heap<LimitedInputStream>(kj::mv(readEnd), l);
   }
@@ -1728,17 +1728,17 @@ OneWayPipe newOneWayPipe(kj::Maybe<uint64_t> expectedLength) {
 }
 
 TwoWayPipe newTwoWayPipe() {
-  auto pipe1 = kj::refcounted<AsyncPipe>();
-  auto pipe2 = kj::refcounted<AsyncPipe>();
-  auto end1 = kj::heap<TwoWayPipeEnd>(kj::addRef(*pipe1), kj::addRef(*pipe2));
+  auto pipe1 = kj::rc<AsyncPipe>();
+  auto pipe2 = kj::rc<AsyncPipe>();
+  auto end1 = kj::heap<TwoWayPipeEnd>(pipe1.addRef(), pipe2.addRef());
   auto end2 = kj::heap<TwoWayPipeEnd>(kj::mv(pipe2), kj::mv(pipe1));
   return { { kj::mv(end1), kj::mv(end2) } };
 }
 
 CapabilityPipe newCapabilityPipe() {
-  auto pipe1 = kj::refcounted<AsyncPipe>();
-  auto pipe2 = kj::refcounted<AsyncPipe>();
-  auto end1 = kj::heap<TwoWayPipeEnd>(kj::addRef(*pipe1), kj::addRef(*pipe2));
+  auto pipe1 = kj::rc<AsyncPipe>();
+  auto pipe2 = kj::rc<AsyncPipe>();
+  auto end1 = kj::heap<TwoWayPipeEnd>(pipe1.addRef(), pipe2.addRef());
   auto end2 = kj::heap<TwoWayPipeEnd>(kj::mv(pipe2), kj::mv(pipe1));
   return { { kj::mv(end1), kj::mv(end2) } };
 }
@@ -1771,11 +1771,7 @@ class AsyncTee final: public Refcounted {
     uint64_t size() const;
 
     Buffer clone() const {
-      size_t size = 0;
-      for (const auto& buf: bufferList) {
-        size += buf.size();
-      }
-      auto builder = heapArrayBuilder<byte>(size);
+      auto builder = heapArrayBuilder<byte>(totalSize);
       for (const auto& buf: bufferList) {
         builder.addAll(buf);
       }
@@ -1785,9 +1781,17 @@ class AsyncTee final: public Refcounted {
     }
 
   private:
-    Buffer(std::deque<Array<byte>>&& buffer) : bufferList(mv(buffer)) {}
+    Buffer(std::deque<Array<byte>>&& buffer): bufferList(mv(buffer)) {
+      for (const auto& buf: bufferList) {
+        totalSize += buf.size();
+      }
+    }
 
     std::deque<Array<byte>> bufferList;
+
+    // Sum of the sizes of everything in `bufferList`. Kept in sync by produce(), consume() and
+    // asArray().
+    uint64_t totalSize = 0;
   };
 
   class Sink;
@@ -2218,7 +2222,6 @@ private:
       n.maxBytes = kj::min(n.maxBytes, bufferSizeLimit);
       n.maxBytes = kj::max(n.minBytes, n.maxBytes);
       for (auto& branch: branches) {
-        // TODO(perf): buffer.size() is O(n) where n = # of individual heap-allocated byte arrays.
         if (branch.buffer.size() + n.maxBytes > bufferSizeLimit) {
           stoppage = Stoppage(KJ_EXCEPTION(FAILED, "tee buffer size limit exceeded"));
           return pullLoop();
@@ -2296,14 +2299,18 @@ uint64_t AsyncTee::Buffer::consume(ArrayPtr<byte>& readBuffer, size_t& minBytes)
       bufferList.pop_front();
     } else {
       bytes = heapArray(bytes.slice(amount, bytes.size()));
-      return totalAmount;
+      break;
     }
   }
+
+  KJ_ASSERT(totalSize >= totalAmount);
+  totalSize -= totalAmount;
 
   return totalAmount;
 }
 
 void AsyncTee::Buffer::produce(Array<byte> bytes) {
+  totalSize += bytes.size();
   bufferList.push_back(mv(bytes));
 }
 
@@ -2337,6 +2344,8 @@ Array<const ArrayPtr<const byte>> AsyncTee::Buffer::asArray(
     }
   }
 
+  KJ_DASSERT(totalSize >= amount);
+  totalSize -= amount;
 
   if (buffers.size() > 0) {
     return buffers.releaseAsArray().attach(mv(ownBuffers));
@@ -2350,13 +2359,7 @@ bool AsyncTee::Buffer::empty() const {
 }
 
 uint64_t AsyncTee::Buffer::size() const {
-  uint64_t result = 0;
-
-  for (auto& bytes: bufferList) {
-    result += bytes.size();
-  }
-
-  return result;
+  return totalSize;
 }
 
 }  // namespace

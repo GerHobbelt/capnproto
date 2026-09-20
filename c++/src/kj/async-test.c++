@@ -26,6 +26,7 @@
 #include "mutex.h"
 #include "thread.h"
 #include <kj/compat/gtest.h>
+#include <signal.h>
 
 #if !_WIN32
 #include <errno.h>
@@ -1473,6 +1474,33 @@ KJ_TEST("Maximum turn count during wait scope poll is enforced") {
   KJ_ASSERT(count == 0);
 }
 
+KJ_TEST("EventLoop::Id") {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
+  auto id1 = EventLoop::Id::current();
+  id1.assertCurrentEventLoop();
+
+  auto id2 = EventLoop::Id::current();
+  KJ_ASSERT(id2 == id1);
+
+  KJ_ASSERT(loop.id() == id1);
+
+  Thread thread([&]() {
+    EventLoop loop2;
+    WaitScope waitScope2(loop2);
+
+    auto id3 = EventLoop::Id::current();
+    id3.assertCurrentEventLoop();
+    KJ_ASSERT(id1 != id3);
+    KJ_ASSERT(id2 != id3);
+    KJ_ASSERT(loop2.id() == id3);
+    KJ_ASSERT(loop.id() != id3);
+
+    KJ_EXPECT_THROW_MESSAGE("loop->loopId == id", id1.assertCurrentEventLoop());
+  });
+}
+
 KJ_TEST("exclusiveJoin both events complete simultaneously") {
   // Previously, if both branches of an exclusiveJoin() completed simultaneously, then the parent
   // event could be armed twice. This is an error, but the exact results of this error depend on
@@ -2103,17 +2131,57 @@ public:
       : Event({}), log(log), name(name) {}
 
 protected:
-  Maybe<Own<Event>> fire() override {
-    log.add(name);
-    return kj::none;
-  }
-
+  void fire() override { log.add(name); }
   void traceEvent(_::TraceBuilder& builder) override {}
 
 private:
   Vector<StringPtr>& log;
   StringPtr name;
 };
+
+class SelfDeletingEvent final: public _::Event {
+public:
+  SelfDeletingEvent(Own<SelfDeletingEvent>& owner, bool permitDestruction)
+      : Event({}), owner(owner), permitDestruction(permitDestruction) {}
+
+protected:
+  void fire() override {
+    if (permitDestruction) {
+      permitSelfDestruction();
+    }
+    owner = nullptr;
+  }
+
+  void traceEvent(_::TraceBuilder& builder) override {}
+
+private:
+  Own<SelfDeletingEvent>& owner;
+  bool permitDestruction;
+};
+
+KJ_TEST("Event may delete itself after permitting self-destruction") {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+  Own<SelfDeletingEvent> event;
+  event = heap<SelfDeletingEvent>(event, true);
+
+  event->armDepthFirst();
+  waitScope.poll();
+
+  KJ_EXPECT(event.get() == nullptr);
+}
+
+KJ_TEST("Event may not delete itself without permitting self-destruction") {
+  KJ_EXPECT_SIGNAL(SIGABRT, {
+    EventLoop loop;
+    WaitScope waitScope(loop);
+    Own<SelfDeletingEvent> event;
+    event = heap<SelfDeletingEvent>(event, false);
+
+    event->armDepthFirst();
+    waitScope.poll();
+  });
+}
 
 KJ_TEST("Event arm methods - single event each type") {
   EventLoop loop;
@@ -2321,7 +2389,7 @@ public:
         armMethod(armMethod) {}
 
 protected:
-  Maybe<Own<Event>> fire() override {
+  void fire() override {
     log.add(name);
     for (auto* e : toArm) {
       switch (armMethod) {
@@ -2330,7 +2398,6 @@ protected:
         case ArmMethod::LAST: e->armLast(); break;
       }
     }
-    return kj::none;
   }
 
   void traceEvent(_::TraceBuilder& builder) override {}
