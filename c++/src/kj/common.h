@@ -519,22 +519,11 @@ struct DisallowConstCopy {
   // type that contains or inherits from a type that disallows const copies will also automatically
   // disallow const copies.  Hey, cool, that's exactly what we want.
 
-#if CAPNP_DEBUG_TYPES
-  // Alas! Declaring a defaulted non-const copy constructor tickles a bug which causes GCC and
-  // Clang to disagree on ABI, using different calling conventions to pass this type, leading to
-  // immediate segfaults. See:
-  //     https://bugs.llvm.org/show_bug.cgi?id=23764
-  //     https://gcc.gnu.org/bugzilla/show_bug.cgi?id=58074
-  //
-  // Because of this, we can't use this technique. We guard it by CAPNP_DEBUG_TYPES so that it
-  // still applies to the Cap'n Proto developers during internal testing.
-
   DisallowConstCopy() = default;
   DisallowConstCopy(DisallowConstCopy&) = default;
   DisallowConstCopy(DisallowConstCopy&&) = default;
   DisallowConstCopy& operator=(DisallowConstCopy&) = default;
   DisallowConstCopy& operator=(DisallowConstCopy&&) = default;
-#endif
 };
 
 #if _MSC_VER && !defined(__clang__)
@@ -2452,6 +2441,16 @@ struct Mapper<Maybe<T>> {
 template <typename T>
 class Array;
 
+namespace _ {  // private
+class SplitIteratorEnd;
+
+template <typename T>
+class SplitIterator;
+
+template <typename T>
+class SplitIterable;
+}  // namespace _ (private)
+
 template <typename T>
 class ArrayPtr: public DisallowConstCopyIfNotConst<T> {
   // A pointer to an array.  Includes a size.  Like any pointer, it doesn't own the target data,
@@ -2597,6 +2596,10 @@ public:
     return kj::none;
   }
 
+  inline auto split(T delim) { return _::SplitIterable<T>(*this, kj::mv(delim)); }
+  inline auto split(T delim) const { return _::SplitIterable<const T>(asConst(), kj::mv(delim)); }
+  // Returns iterator of segments (ArrayPtr<T>)
+
   constexpr ArrayPtr<PropagateConst<T, byte>> asBytes() const {
     // Reinterpret the array as a byte array. This is explicitly legal under C++ aliasing
     // rules.
@@ -2734,8 +2737,69 @@ private:
   }
 };
 
+namespace _ {  // private
+
+class SplitIteratorEnd {};
+
+template <typename T>
+class SplitIterator {
+public:
+  inline SplitIterator(ArrayPtr<T> array, T delim) : array(array), end(0), delim(kj::mv(delim)) {
+    nextSegment();
+  }
+
+  inline ArrayPtr<T> operator*() { return array.first(end); }
+
+  inline SplitIterator& operator++() {
+    if (end == array.size()) {
+      end = array.size() + 1;
+    } else {
+      array = array.slice(end + 1);
+      nextSegment();
+    }
+    return *this;
+  }
+
+  inline bool operator==(const SplitIterator& other) const {
+    return array == other.array && end == other.end;
+  }
+  inline bool operator==(SplitIteratorEnd) const { return end == array.size() + 1; }
+
+private:
+  ArrayPtr<T> array;
+  // The remaining suffix starting at the current segment.
+  size_t end;
+  // Delimiter index, array.size() for the final segment, or array.size() + 1 when exhausted.
+  
+  const T delim;
+
+  inline void nextSegment() {
+    KJ_IF_SOME(index, array.findFirst(delim)) {
+      end = index;
+    } else {
+      end = array.size();
+    }
+  }
+};
+
+template <typename T>
+class SplitIterable {
+public:
+  inline SplitIterable(ArrayPtr<T> array, T&& delim) : array(array), delim(kj::mv(delim)) {}
+  inline SplitIterator<T> begin() { return SplitIterator<T>(array, delim); }
+  inline SplitIterator<const T> begin() const { return SplitIterator<const T>(array.asConst(), delim); }
+  inline SplitIteratorEnd end() const { return SplitIteratorEnd(); }
+
+private:
+  ArrayPtr<T> array;
+  const T delim;
+};
+
+}  // namespace _ (private)
+
 template <>
 inline Maybe<size_t> ArrayPtr<const char>::findFirst(const char& c) const {
+  if (size_ == 0) return kj::none;
   const char* pos = reinterpret_cast<const char*>(memchr(ptr, c, size_));
   if (pos == nullptr) {
     return kj::none;
@@ -2746,6 +2810,7 @@ inline Maybe<size_t> ArrayPtr<const char>::findFirst(const char& c) const {
 
 template <>
 inline Maybe<size_t> ArrayPtr<char>::findFirst(const char& c) const {
+  if (size_ == 0) return kj::none;
   char* pos = reinterpret_cast<char*>(memchr(ptr, c, size_));
   if (pos == nullptr) {
     return kj::none;
@@ -2756,6 +2821,7 @@ inline Maybe<size_t> ArrayPtr<char>::findFirst(const char& c) const {
 
 template <>
 inline Maybe<size_t> ArrayPtr<const byte>::findFirst(const byte& c) const {
+  if (size_ == 0) return kj::none;
   const byte* pos = reinterpret_cast<const byte*>(memchr(ptr, c, size_));
   if (pos == nullptr) {
     return kj::none;
@@ -2766,6 +2832,7 @@ inline Maybe<size_t> ArrayPtr<const byte>::findFirst(const byte& c) const {
 
 template <>
 inline Maybe<size_t> ArrayPtr<byte>::findFirst(const byte& c) const {
+  if (size_ == 0) return kj::none;
   byte* pos = reinterpret_cast<byte*>(memchr(ptr, c, size_));
   if (pos == nullptr) {
     return kj::none;
