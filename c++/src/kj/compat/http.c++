@@ -223,7 +223,7 @@ void SHA1Transform(
     /* Wipe variables */
     a = b = c = d = e = 0;
 #ifdef SHA1HANDSOFF
-    memset(block, '\0', sizeof(block));
+    block[0] = {};
 #endif
 }
 
@@ -323,8 +323,8 @@ void SHA1Final(
             ((context->state[i >> 2] >> ((3 - (i & 3)) * 8)) & 255);
     }
     /* Wipe variables */
-    memset(context, '\0', sizeof(*context));
-    memset(&finalcount, '\0', sizeof(finalcount));
+    *context = {};
+    kj::arrayPtr(finalcount).fill('\0');
 }
 
 // End SHA-1 implementation.
@@ -3227,7 +3227,7 @@ private:
       KJ_IF_SOME(g, generator) {
         g.generate(maskBytes);
       } else {
-        memset(maskBytes, 0, 4);
+        kj::arrayPtr(maskBytes).fill(0);
       }
     }
 
@@ -3286,7 +3286,7 @@ private:
         bytes[2] = static_cast<byte>(payloadLen >> 56);
         bytes[3] = static_cast<byte>(payloadLen >> 48);
         bytes[4] = static_cast<byte>(payloadLen >> 40);
-        bytes[5] = static_cast<byte>(payloadLen >> 42);
+        bytes[5] = static_cast<byte>(payloadLen >> 32);
         bytes[6] = static_cast<byte>(payloadLen >> 24);
         bytes[7] = static_cast<byte>(payloadLen >> 16);
         bytes[8] = static_cast<byte>(payloadLen >>  8);
@@ -6525,15 +6525,15 @@ public:
     if (!connectSettings.useTls) {
       KJ_IF_SOME(wrapper, settings.tlsContext) {
         KJ_IF_SOME(tlsStarter, connectSettings.tlsStarter) {
-          auto transitConnectionRef = kj::refcountedWrapper(
+          kj::Rc<TransitionaryAsyncIoStream> transitConnectionRef(
               kj::heap<TransitionaryAsyncIoStream>(kj::mv(connection)));
           Function<kj::Promise<void>(kj::StringPtr)> cb =
-              [&wrapper, ref1 = transitConnectionRef->addWrappedRef()](
+              [&wrapper, ref1 = transitConnectionRef.addRef()](
               kj::StringPtr expectedServerHostname) mutable {
             ref1->startTls(&wrapper, expectedServerHostname);
             return kj::READY_NOW;
           };
-          connection = transitConnectionRef->addWrappedRef();
+          connection = transitConnectionRef.addRef().toOwn();
           tlsStarter = kj::mv(cb);
         }
       }

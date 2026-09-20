@@ -696,6 +696,14 @@ template<typename T> constexpr T cp(T& t) noexcept { return T(t); }
 template<typename T> constexpr T cp(const T& t) noexcept { return T(t); }
 // Useful to force a copy, particularly to pass into a function that expects T&&.
 
+template <typename T>
+void swp(T& a, T& b) {
+  // Swap two values. Similar to std::swap. Using kj::swap collides with libc++ sources.
+  T tmp = kj::mv(a);
+  a = kj::mv(b);
+  b = kj::mv(tmp);
+}
+
 template <typename T, typename U, bool takeT, bool uOK = true> struct ChooseType_;
 template <typename T, typename U> struct ChooseType_<T, U, true, true> { typedef T Type; };
 template <typename T, typename U> struct ChooseType_<T, U, true, false> { typedef T Type; };
@@ -2570,14 +2578,16 @@ public:
     return ArrayPtr(ptr + start, size_ - start);
   }
   inline constexpr bool startsWith(const ArrayPtr<const T>& other) const {
-    return other.size() <= size_ && slice(0, other.size()) == other;
+    return other.size() <= size_ && first(other.size()) == other;
   }
   inline constexpr bool endsWith(const ArrayPtr<const T>& other) const {
     return other.size() <= size_ && slice(size_ - other.size(), size_) == other;
   }
 
+  // NOLINTBEGIN(*-arrayptr-slice-zero)
   inline constexpr ArrayPtr first(size_t count) { return slice(0, count); }
   inline constexpr ArrayPtr<const T> first(size_t count) const { return slice(0, count); }
+  // NOLINTEND(*-arrayptr-slice-zero)
 
   inline Maybe<size_t> findFirst(const T& match) const {
     for (size_t i = 0; i < size_; i++) {
@@ -2723,6 +2733,22 @@ public:
     for (size_t s = size_, i = 0; i < s; i++) { dst[i] = src[i]; }
   }
 
+  inline void write(kj::ArrayPtr<const T> other) {
+    // Copy data to the head of this pointer, then advance past the copied data.
+    // Out-of-bounds exception is raised if data does not fit.
+    // NOLINTNEXTLINE(*-arrayptr-first-copyfrom)
+    first(other.size()).copyFrom(other); // first will do a bounds check
+    ptr += other.size();
+    size_ -= other.size();
+  }
+
+  inline void write(kj::ArrayPtr<const kj::ArrayPtr<const T>> pieces) {
+    // Copy pieces of data to the head of this pointer, then advancing past the copied data.
+    // Pieces are bound-checked individually, i.e. the data can be partially written when raising
+    // an out-of-bounds exception.
+    for (auto piece: pieces) { write(piece); }
+  }
+
 private:
   T* ptr;
   size_t size_;
@@ -2859,7 +2885,7 @@ inline constexpr ArrayPtr<T> arrayPtr(T* begin KJ_LIFETIMEBOUND, T* end KJ_LIFET
 template <typename T>
 inline constexpr ArrayPtr<T> arrayPtr(T& t KJ_LIFETIMEBOUND) {
   // Construct ArrayPtr pointing to a single object instance.
-  return arrayPtr(&t, 1);
+  return arrayPtr(&t, 1); //NOLINT(*-arrayptr-singleton)
 }
 
 template <typename T, size_t s>
@@ -2870,7 +2896,7 @@ inline constexpr ArrayPtr<T> arrayPtr(T (&arr)[s]) {
 
 template <typename... Params>
 auto asBytes(Params&&... params) {
-  return kj::arrayPtr(kj::fwd<Params>(params)...).asBytes();
+  return kj::arrayPtr(kj::fwd<Params>(params)...).asBytes(); // NOLINT(*-arrayptr-as-bytes)
 }
 
 // =======================================================================================

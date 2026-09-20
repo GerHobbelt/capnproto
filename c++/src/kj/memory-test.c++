@@ -19,7 +19,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#include "kj/common.h"
 #include "kj/string.h"
 #include "kj/refcount.h"
 #include "kj/test.h"
@@ -1010,6 +1009,14 @@ struct Obj2 : public Obj {
   int size;
 };
 
+struct OtherBase {
+  int other = 123;
+};
+
+struct MultiBaseObj2 : public OtherBase, public Obj2 {
+  MultiBaseObj2(kj::StringPtr name, int size) : Obj2(name, size) {}
+};
+
 KJ_TEST("kj::Ptr<T> subtyping") {
   // pin the child
   kj::Pin<Obj2> pin("obj2", 42);
@@ -1025,10 +1032,316 @@ KJ_TEST("kj::Ptr<T> subtyping") {
   KJ_EXPECT(ptr2 == pin);
   KJ_EXPECT(ptr1 == ptr2);
 
-  // pointers can be converted to the base type too
-  kj::Ptr<Obj> ptr3 = kj::mv(ptr1);
+  // pointers can be copied or moved to the base type too
+  kj::Ptr<Obj> ptr3 = ptr1;
   KJ_EXPECT(ptr3->name == "obj2"_kj);
   KJ_EXPECT(ptr3 == pin);
+
+  kj::Ptr<Obj> ptr4 = kj::mv(ptr1);
+  KJ_EXPECT(ptr4->name == "obj2"_kj);
+  KJ_EXPECT(ptr4 == pin);
+
+  kj::Ptr<const Obj2> ptr5 = pin;
+  KJ_EXPECT(ptr5->name == "obj2"_kj);
+}
+
+KJ_TEST("kj::Weak<T> subtyping") {
+  static_assert(kj::canConvert<kj::Weak<Obj2>, kj::Weak<Obj>>(), "failure");
+  static_assert(!kj::canConvert<kj::Weak<Obj>, kj::Weak<Obj2>>(), "failure");
+  static_assert(kj::canConvert<kj::Weak<Obj2>, kj::Weak<const Obj>>(), "failure");
+  static_assert(kj::MaybeTraits<kj::Weak<Obj>>::convertingConstructor,
+      "Maybe<Weak<T>> should opt into converting construction");
+  static_assert(kj::canConvert<kj::Weak<Obj2>, kj::Maybe<kj::Weak<Obj>>>(),
+      "Maybe<Weak<Base>> should be implicitly constructible from Weak<Derived>");
+  static_assert(!kj::canConvert<kj::Weak<Obj>, kj::Maybe<kj::Weak<Obj2>>>(),
+      "Maybe<Weak<Derived>> should not be implicitly constructible from Weak<Base>");
+
+  kj::Pin<Obj2> pin("obj2", 42);
+  kj::Weak<Obj2> weak1 = pin.addWeak();
+  kj::Weak<Obj> weak2 = weak1;
+  KJ_EXPECT(weak2 == pin);
+  KJ_EXPECT(weak2.assertLive().name == "obj2"_kj);
+
+  kj::Weak<const Obj> weak3 = weak1;
+  KJ_EXPECT(weak3.assertLive().name == "obj2"_kj);
+
+  kj::Maybe<kj::Weak<Obj>> maybeWeak = weak1;
+  KJ_IF_SOME(weak, maybeWeak) {
+    KJ_EXPECT(weak == pin);
+    KJ_EXPECT(weak.assertLive().name == "obj2"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected Maybe<Weak<T>> to contain a pointer");
+  }
+
+  kj::Pin<MultiBaseObj2> multiPin("multi", 123);
+  kj::Weak<MultiBaseObj2> multiWeak = multiPin.addWeak();
+  kj::Weak<Obj> baseWeak = multiWeak;
+  KJ_EXPECT(baseWeak.assertLive().name == "multi"_kj);
+  KJ_IF_SOME(basePtr, baseWeak) {
+    KJ_EXPECT(basePtr->name == "multi"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected Weak<Base> to upgrade");
+  }
+
+  kj::Pin<MultiBaseObj2> movedMultiPin(kj::mv(multiPin));
+  KJ_EXPECT(baseWeak.tryGet() == kj::none);
+  KJ_EXPECT(baseWeak.upgrade() == kj::none);
+
+  kj::Weak<Obj> movedBaseWeak = movedMultiPin.addWeak();
+  KJ_EXPECT(movedBaseWeak == movedMultiPin);
+  KJ_EXPECT(movedBaseWeak.assertLive().name == "multi"_kj);
+  KJ_IF_SOME(basePtr, movedBaseWeak) {
+    KJ_EXPECT(basePtr->name == "multi"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected new Weak<Base> to upgrade after move");
+  }
+}
+
+KJ_TEST("kj::Weak<T> basic properties") {
+  kj::Weak<Obj> nullWeak = nullptr;
+  KJ_EXPECT(nullWeak == nullptr);
+  KJ_IF_SOME(obj, nullWeak) {
+    KJ_FAIL_EXPECT("expected KJ_IF_SOME on null Weak<T> to be empty", obj->name);
+  } else {
+    KJ_EXPECT(true);
+  }
+
+  kj::Pin<Obj> pin("a");
+
+  kj::Weak<Obj> weak1 = pin.addWeak();
+  KJ_EXPECT(weak1 == pin);
+  KJ_EXPECT(pin == weak1);
+  KJ_EXPECT(weak1.assertLive().name == "a"_kj);
+
+  KJ_IF_SOME(obj, weak1.tryGet()) {
+    static_assert(kj::isSameType<decltype(obj), Obj&>());
+    KJ_EXPECT(obj.name == "a"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected Weak<T> to contain a pointer");
+  }
+
+  KJ_IF_SOME(obj, weak1) {
+    static_assert(kj::isSameType<decltype(obj), kj::Ptr<Obj>&>());
+    KJ_EXPECT(obj->name == "a"_kj);
+    obj->name = kj::str("b");
+  } else {
+    KJ_FAIL_EXPECT("expected KJ_IF_SOME on Weak<T> to contain a pointer");
+  }
+  KJ_EXPECT(pin->name == "b"_kj);
+
+  const auto& constWeak = weak1;
+  KJ_IF_SOME(obj, constWeak) {
+    static_assert(kj::isSameType<decltype(obj), kj::Ptr<const Obj>&>());
+    KJ_EXPECT(obj->name == "b"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected KJ_IF_SOME on const Weak<T> to contain a pointer");
+  }
+
+  KJ_IF_SOME(obj, pin.addWeak()) {
+    static_assert(kj::isSameType<decltype(obj), kj::Ptr<Obj>&>());
+    KJ_EXPECT(obj->name == "b"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected KJ_IF_SOME on temporary Weak<T> to contain a pointer");
+  }
+
+  kj::Weak<Obj> weak2 = weak1;
+  KJ_EXPECT(weak1 == weak2);
+  KJ_EXPECT(weak2.assertLive().name == "b"_kj);
+
+  weak2 = nullptr;
+  KJ_EXPECT(weak2 == nullptr);
+}
+
+KJ_TEST("kj::Ptr<T> and kj::Weak<T> conversion") {
+  kj::Pin<Obj> pin("a");
+
+  kj::Ptr<Obj> ptr = pin;
+  kj::Weak<Obj> weak = ptr.asWeak();
+  KJ_EXPECT(weak == pin);
+  KJ_EXPECT(weak.assertLive().name == "a"_kj);
+
+  kj::Weak<Obj> weakFromPtr = ptr;
+  KJ_EXPECT(weakFromPtr == pin);
+  KJ_EXPECT(weakFromPtr.assertLive().name == "a"_kj);
+
+  kj::Weak<Obj> weakFromTemp = pin.asPtr();
+  KJ_EXPECT(weakFromTemp == pin);
+  KJ_EXPECT(weakFromTemp.assertLive().name == "a"_kj);
+
+  KJ_IF_SOME(strong, weak) {
+    static_assert(kj::isSameType<decltype(strong), kj::Ptr<Obj>&>());
+    KJ_EXPECT(strong == pin);
+    KJ_EXPECT(strong->name == "a"_kj);
+
+    kj::Weak<Obj> weak2 = strong.asWeak();
+    KJ_EXPECT(weak2 == pin);
+  } else {
+    KJ_FAIL_EXPECT("expected KJ_IF_SOME on Weak<T> to upgrade");
+  }
+
+  auto strongFromRequire = KJ_REQUIRE_NONNULL(weak);
+  static_assert(kj::isSameType<decltype(strongFromRequire), kj::Ptr<Obj>>());
+  KJ_EXPECT(strongFromRequire == pin);
+  KJ_EXPECT(strongFromRequire->name == "a"_kj);
+
+  KJ_IF_SOME(strong, weak.upgrade()) {
+    KJ_EXPECT(strong == pin);
+    KJ_EXPECT(strong->name == "a"_kj);
+
+    kj::Weak<Obj> weak2 = strong.asWeak();
+    KJ_EXPECT(weak2 == pin);
+  } else {
+    KJ_FAIL_EXPECT("expected Weak<T> to upgrade");
+  }
+
+  const auto& constWeak = weak;
+  KJ_IF_SOME(strong, constWeak) {
+    static_assert(kj::isSameType<decltype(strong), kj::Ptr<const Obj>&>());
+    KJ_EXPECT(strong->name == "a"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected KJ_IF_SOME on const Weak<T> to upgrade");
+  }
+
+  auto strongFromConstRequire = KJ_REQUIRE_NONNULL(constWeak);
+  static_assert(kj::isSameType<decltype(strongFromConstRequire), kj::Ptr<const Obj>>());
+  KJ_EXPECT(strongFromConstRequire->name == "a"_kj);
+
+  KJ_IF_SOME(strong, constWeak.upgrade()) {
+    static_assert(kj::isSameType<decltype(strong), kj::Ptr<const Obj>&>());
+    KJ_EXPECT(strong->name == "a"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected const Weak<T> to upgrade");
+  }
+}
+
+KJ_TEST("kj::Weak<T> expires when Pin<T> is destroyed") {
+  kj::Maybe<kj::Weak<Obj>> maybeWeak;
+  {
+    kj::Pin<Obj> pin("a");
+    maybeWeak = pin.addWeak();
+
+    KJ_IF_SOME(weak, maybeWeak) {
+      KJ_EXPECT(weak.assertLive().name == "a"_kj);
+    } else {
+      KJ_FAIL_EXPECT("expected Maybe<Weak<T>> to contain a pointer");
+    }
+  }
+
+  KJ_IF_SOME(weak, maybeWeak) {
+    KJ_EXPECT(weak.tryGet() == kj::none);
+    KJ_EXPECT(weak.upgrade() == kj::none);
+    KJ_IF_SOME(obj, weak) {
+      KJ_FAIL_EXPECT("expected KJ_IF_SOME on expired Weak<T> to be empty", obj->name);
+    } else {
+      KJ_EXPECT(true);
+    }
+    KJ_EXPECT_THROW_MESSAGE("null Weak<> dereference", (void)weak.assertLive());
+  } else {
+    KJ_FAIL_EXPECT("expected Maybe<Weak<T>> to contain an expired pointer");
+  }
+}
+
+KJ_TEST("kj::Pin<T> moved with active weak refs expires weak refs") {
+  kj::Maybe<kj::Weak<Obj>> maybeWeak;
+  {
+    kj::Pin<Obj> pin("a");
+    maybeWeak = pin.addWeak();
+
+    kj::Pin<Obj> pin2(kj::mv(pin));
+    KJ_EXPECT(pin2->name == "a"_kj);
+
+    KJ_IF_SOME(weak, maybeWeak) {
+      KJ_EXPECT(weak.tryGet() == kj::none);
+      KJ_EXPECT(weak.upgrade() == kj::none);
+
+      kj::Weak<Obj> newWeak = pin2.addWeak();
+      KJ_EXPECT(newWeak == pin2);
+      KJ_EXPECT(newWeak.assertLive().name == "a"_kj);
+    } else {
+      KJ_FAIL_EXPECT("expected Maybe<Weak<T>> to contain a pointer");
+    }
+  }
+
+  KJ_IF_SOME(weak, maybeWeak) {
+    KJ_EXPECT(weak.tryGet() == kj::none);
+  } else {
+    KJ_FAIL_EXPECT("expected Maybe<Weak<T>> to contain an expired pointer");
+  }
+}
+
+KJ_TEST("Maybe<kj::Ptr<T>> niche optimization") {
+  static_assert(sizeof(kj::Maybe<kj::Ptr<Obj>>) == sizeof(kj::Ptr<Obj>),
+      "Maybe<Ptr<T>> should have no size overhead due to niche optimization");
+  static_assert(alignof(kj::Maybe<kj::Ptr<Obj>>) == alignof(kj::Ptr<Obj>),
+      "Maybe<Ptr<T>> should preserve Ptr<T>'s alignment");
+
+  kj::Maybe<kj::Ptr<Obj>> empty;
+  KJ_EXPECT(empty == kj::none);
+
+  kj::Pin<Obj> pin("a");
+  empty = pin.asPtr();
+
+  KJ_IF_SOME(ptr, empty) {
+    KJ_EXPECT(ptr == pin);
+    KJ_EXPECT(ptr->name == "a"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected Maybe<Ptr<T>> to contain a pointer");
+  }
+
+  kj::Maybe<kj::Ptr<Obj>> copy = empty;
+  KJ_IF_SOME(ptr, copy) {
+    KJ_EXPECT(ptr == pin);
+  } else {
+    KJ_FAIL_EXPECT("expected copied Maybe<Ptr<T>> to contain a pointer");
+  }
+
+  KJ_IF_SOME(ptr, kj::mv(empty)) {
+    KJ_EXPECT(ptr == pin);
+  } else {
+    KJ_FAIL_EXPECT("expected moved Maybe<Ptr<T>> to contain a pointer");
+  }
+  KJ_EXPECT(empty == kj::none);
+
+  copy = kj::none;
+  KJ_EXPECT(copy == kj::none);
+}
+
+KJ_TEST("Maybe<kj::Ptr<T>> converting constructor") {
+  static_assert(kj::MaybeTraits<kj::Ptr<Obj>>::convertingConstructor,
+      "Maybe<Ptr<T>> should opt into converting construction");
+  static_assert(kj::canConvert<kj::Ptr<Obj2>, kj::Maybe<kj::Ptr<Obj>>>(),
+      "Maybe<Ptr<Base>> should be implicitly constructible from Ptr<Derived>");
+  static_assert(!kj::canConvert<kj::Ptr<Obj>, kj::Maybe<kj::Ptr<Obj2>>>(),
+      "Maybe<Ptr<Derived>> should not be implicitly constructible from Ptr<Base>");
+
+  kj::Pin<Obj2> pin("obj2", 42);
+
+  kj::Maybe<kj::Ptr<Obj>> maybe = pin.asPtr();
+  KJ_IF_SOME(ptr, maybe) {
+    KJ_EXPECT(ptr == pin);
+    KJ_EXPECT(ptr->name == "obj2"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected Maybe<Ptr<Base>> to be constructed from Ptr<Derived>");
+  }
+
+  auto makeMaybe = [](kj::Pin<Obj2>& pin) -> kj::Maybe<kj::Ptr<Obj>> {
+    return pin.asPtr();
+  };
+  KJ_IF_SOME(ptr, makeMaybe(pin)) {
+    KJ_EXPECT(ptr == pin);
+    KJ_EXPECT(ptr->name == "obj2"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected Ptr<Derived> return to convert to Maybe<Ptr<Base>>");
+  }
+
+  kj::Maybe<kj::Ptr<Obj>> assigned;
+  assigned = pin.asPtr();
+  KJ_IF_SOME(ptr, assigned) {
+    KJ_EXPECT(ptr == pin);
+    KJ_EXPECT(ptr->name == "obj2"_kj);
+  } else {
+    KJ_FAIL_EXPECT("expected Maybe<Ptr<Base>> to be assigned from Ptr<Derived>");
+  }
 }
 
 #if KJ_ASSERT_PTR_COUNTERS
