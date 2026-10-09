@@ -23,6 +23,7 @@
 #include "array.h"
 #include "string.h"
 #include "thread.h"
+#include "mutex.h"
 #include <kj/compat/gtest.h>
 
 #include <atomic>
@@ -772,6 +773,140 @@ KJ_TEST("Rc inheritance") {
   EXPECT_TRUE(b);
 }
 
+// Maybe<Rc<T>> is niche-optimized: a null Rc is the "none" state, so no extra flag is stored.
+static_assert(NicheOptimizable<Rc<SetTrueInDestructor>>);
+static_assert(sizeof(Maybe<Rc<SetTrueInDestructor>>) == sizeof(Rc<SetTrueInDestructor>));
+static_assert(sizeof(Maybe<Rc<IncompleteDeclaredRefcounted>>) == 2 * sizeof(void*));
+static_assert(sizeof(Maybe<Rc<IncompleteDeclaredNotRefcounted>>) == 2 * sizeof(void*));
+
+KJ_TEST("Maybe<Rc<T>> niche optimization") {
+  bool b = false;
+
+  {
+    Maybe<Rc<SetTrueInDestructor>> maybe;
+    KJ_EXPECT(maybe == kj::none);
+
+    maybe = kj::rc<SetTrueInDestructor>(&b);
+    KJ_EXPECT(maybe != kj::none);
+    KJ_IF_SOME(ref, maybe) {
+      KJ_EXPECT(ref.get() != nullptr);
+      KJ_EXPECT(ref->ptr == &b);
+    } else {
+      KJ_FAIL_EXPECT("expected value");
+    }
+
+    // Moving out leaves the source in the none state.
+    Maybe<Rc<SetTrueInDestructor>> moved = kj::mv(maybe);
+    KJ_EXPECT(maybe == kj::none);
+    KJ_EXPECT(moved != kj::none);
+    KJ_EXPECT(!b);
+
+    // Move-assignment.
+    maybe = kj::mv(moved);
+    KJ_EXPECT(moved == kj::none);
+    KJ_EXPECT(maybe != kj::none);
+    KJ_EXPECT(!b);
+
+    // Setting to none releases the reference.
+    maybe = kj::none;
+    KJ_EXPECT(maybe == kj::none);
+    KJ_EXPECT(b);
+  }
+
+  {
+    // Storing a null Rc yields none, consistent with the niche representation.
+    Maybe<Rc<SetTrueInDestructor>> maybe = Rc<SetTrueInDestructor>();
+    KJ_EXPECT(maybe == kj::none);
+    maybe = Rc<SetTrueInDestructor>(nullptr);
+    KJ_EXPECT(maybe == kj::none);
+  }
+
+  {
+    // emplace()
+    b = false;
+    Maybe<Rc<SetTrueInDestructor>> maybe;
+    auto& ref = maybe.emplace(kj::rc<SetTrueInDestructor>(&b));
+    KJ_EXPECT(ref->ptr == &b);
+    KJ_EXPECT(maybe != kj::none);
+    KJ_EXPECT(!b);
+
+    // Emplacing over an existing value releases the old one.
+    bool b2 = false;
+    maybe.emplace(kj::rc<SetTrueInDestructor>(&b2));
+    KJ_EXPECT(b);
+    KJ_EXPECT(!b2);
+    maybe = kj::none;
+    KJ_EXPECT(b2);
+  }
+
+  {
+    // Destructor releases the reference.
+    b = false;
+    {
+      Maybe<Rc<SetTrueInDestructor>> maybe = kj::rc<SetTrueInDestructor>(&b);
+      KJ_EXPECT(!b);
+    }
+    KJ_EXPECT(b);
+  }
+}
+
+KJ_TEST("Maybe<Rc<T>> converting constructor from Rc<Derived>") {
+  bool b = false;
+
+  auto child = kj::rc<Child>(&b);
+
+  // Implicit conversion Rc<Child> -> Maybe<Rc<SetTrueInDestructor>> via copy-initialization.
+  Maybe<Rc<SetTrueInDestructor>> maybe = child.addRef();
+  KJ_EXPECT(maybe != kj::none);
+  KJ_IF_SOME(ref, maybe) {
+    KJ_EXPECT(ref.get() == child.get());
+  }
+
+  // Converting assignment.
+  Maybe<Rc<SetTrueInDestructor>> maybe2;
+  maybe2 = child.addRef();
+  KJ_EXPECT(maybe2 != kj::none);
+
+  // Maybe<Rc<Child>> -> Maybe<Rc<SetTrueInDestructor>>.
+  Maybe<Rc<Child>> maybeChild = child.addRef();
+  Maybe<Rc<SetTrueInDestructor>> maybe3 = kj::mv(maybeChild);
+  KJ_EXPECT(maybeChild == kj::none);
+  KJ_EXPECT(maybe3 != kj::none);
+
+  child = nullptr;
+  KJ_EXPECT(!b);
+  maybe = kj::none;
+  maybe2 = kj::none;
+  KJ_EXPECT(!b);
+  maybe3 = kj::none;
+  KJ_EXPECT(b);
+}
+
+// Maybe<Rc<T>> does not implicitly convert to a reference to the referent.
+static_assert(!canConvert<Maybe<Rc<SetTrueInDestructor>>&, Maybe<SetTrueInDestructor&>>());
+static_assert(!canConvert<Maybe<Rc<SetTrueInDestructor>>&, Maybe<const SetTrueInDestructor&>>());
+static_assert(!canConvert<const Maybe<Rc<SetTrueInDestructor>>&, Maybe<const SetTrueInDestructor&>>());
+static_assert(!canConvert<Maybe<Rc<Child>>&, Maybe<SetTrueInDestructor&>>());
+
+KJ_TEST("Maybe<Rc<T>> clone") {
+  bool b = false;
+
+  {
+    Maybe<Rc<SetTrueInDestructor>> maybe = kj::rc<SetTrueInDestructor>(&b);
+    Maybe<Rc<SetTrueInDestructor>> clone = maybe.clone();
+    KJ_EXPECT(clone != kj::none);
+    KJ_EXPECT(KJ_ASSERT_NONNULL(maybe) == KJ_ASSERT_NONNULL(clone));
+
+    maybe = kj::none;
+    KJ_EXPECT(!b);
+    clone = kj::none;
+    KJ_EXPECT(b);
+
+    Maybe<Rc<SetTrueInDestructor>> empty;
+    KJ_EXPECT(empty.clone() == kj::none);
+  }
+}
+
 static_assert(sizeof(WeakRc<SetTrueInDestructor>) == 2 * sizeof(void*));
 static_assert(sizeof(WeakRc<IncompleteDeclaredRefcounted>) == 2 * sizeof(void*));
 static_assert(sizeof(WeakRc<IncompleteDeclaredNotRefcounted>) == 2 * sizeof(void*));
@@ -1498,6 +1633,148 @@ KJ_TEST("Arc inheritance") {
   EXPECT_TRUE(b);
 }
 
+// Maybe<Arc<T>> is niche-optimized: a null Arc is the "none" state, so no extra flag is stored.
+static_assert(NicheOptimizable<Arc<AtomicSetTrueInDestructor>>);
+static_assert(sizeof(Maybe<Arc<AtomicSetTrueInDestructor>>) == sizeof(Arc<AtomicSetTrueInDestructor>));
+static_assert(sizeof(Maybe<Arc<IncompleteDeclaredAtomicRefcounted>>) == 2 * sizeof(void*));
+static_assert(sizeof(Maybe<Arc<IncompleteDeclaredNotAtomicRefcounted>>) == 2 * sizeof(void*));
+
+static_assert(Cloneable<Maybe<Arc<AtomicSetTrueInDestructor>>>);
+static_assert(Cloneable<const Maybe<Arc<AtomicSetTrueInDestructor>>>);
+
+// Maybe<Arc<T>> does not implicitly convert to a reference to the referent.
+static_assert(!canConvert<Maybe<Arc<AtomicSetTrueInDestructor>>&,
+                          Maybe<const AtomicSetTrueInDestructor&>>());
+static_assert(!canConvert<Maybe<Arc<AtomicSetTrueInDestructor>>&,
+                          Maybe<AtomicSetTrueInDestructor&>>());
+static_assert(!canConvert<const Maybe<Arc<AtomicSetTrueInDestructor>>&,
+                          Maybe<const AtomicSetTrueInDestructor&>>());
+static_assert(!canConvert<Maybe<Arc<AtomicChild>>&, Maybe<const AtomicSetTrueInDestructor&>>());
+
+KJ_TEST("Maybe<Arc<T>> niche optimization") {
+  bool b = false;
+
+  {
+    Maybe<Arc<AtomicSetTrueInDestructor>> maybe;
+    KJ_EXPECT(maybe == kj::none);
+
+    maybe = kj::arc<AtomicSetTrueInDestructor>(&b);
+    KJ_EXPECT(maybe != kj::none);
+    KJ_IF_SOME(ref, maybe) {
+      KJ_EXPECT(ref.get() != nullptr);
+      KJ_EXPECT(ref->ptr == &b);
+    } else {
+      KJ_FAIL_EXPECT("expected value");
+    }
+
+    // Moving out leaves the source in the none state.
+    Maybe<Arc<AtomicSetTrueInDestructor>> moved = kj::mv(maybe);
+    KJ_EXPECT(maybe == kj::none);
+    KJ_EXPECT(moved != kj::none);
+    KJ_EXPECT(!b);
+
+    // Move-assignment.
+    maybe = kj::mv(moved);
+    KJ_EXPECT(moved == kj::none);
+    KJ_EXPECT(maybe != kj::none);
+    KJ_EXPECT(!b);
+
+    // Setting to none releases the reference.
+    maybe = kj::none;
+    KJ_EXPECT(maybe == kj::none);
+    KJ_EXPECT(b);
+  }
+
+  {
+    // Storing a null Arc yields none, consistent with the niche representation.
+    Maybe<Arc<AtomicSetTrueInDestructor>> maybe = Arc<AtomicSetTrueInDestructor>();
+    KJ_EXPECT(maybe == kj::none);
+    maybe = Arc<AtomicSetTrueInDestructor>(nullptr);
+    KJ_EXPECT(maybe == kj::none);
+  }
+
+  {
+    // emplace()
+    b = false;
+    Maybe<Arc<AtomicSetTrueInDestructor>> maybe;
+    auto& ref = maybe.emplace(kj::arc<AtomicSetTrueInDestructor>(&b));
+    KJ_EXPECT(ref->ptr == &b);
+    KJ_EXPECT(maybe != kj::none);
+    KJ_EXPECT(!b);
+
+    // Emplacing over an existing value releases the old one.
+    bool b2 = false;
+    maybe.emplace(kj::arc<AtomicSetTrueInDestructor>(&b2));
+    KJ_EXPECT(b);
+    KJ_EXPECT(!b2);
+    maybe = kj::none;
+    KJ_EXPECT(b2);
+  }
+
+  {
+    // Destructor releases the reference.
+    b = false;
+    {
+      Maybe<Arc<AtomicSetTrueInDestructor>> maybe = kj::arc<AtomicSetTrueInDestructor>(&b);
+      KJ_EXPECT(!b);
+    }
+    KJ_EXPECT(b);
+  }
+}
+
+KJ_TEST("Maybe<Arc<T>> converting constructor from Arc<Derived>") {
+  bool b = false;
+
+  auto child = kj::arc<AtomicChild>(&b);
+
+  // Implicit conversion Arc<AtomicChild> -> Maybe<Arc<AtomicSetTrueInDestructor>> via
+  // copy-initialization.
+  Maybe<Arc<AtomicSetTrueInDestructor>> maybe = child.addRef();
+  KJ_EXPECT(maybe != kj::none);
+  KJ_IF_SOME(ref, maybe) {
+    KJ_EXPECT(ref.get() == child.get());
+  }
+
+  // Converting assignment.
+  Maybe<Arc<AtomicSetTrueInDestructor>> maybe2;
+  maybe2 = child.addRef();
+  KJ_EXPECT(maybe2 != kj::none);
+
+  // Maybe<Arc<AtomicChild>> -> Maybe<Arc<AtomicSetTrueInDestructor>>.
+  Maybe<Arc<AtomicChild>> maybeChild = child.addRef();
+  Maybe<Arc<AtomicSetTrueInDestructor>> maybe3 = kj::mv(maybeChild);
+  KJ_EXPECT(maybeChild == kj::none);
+  KJ_EXPECT(maybe3 != kj::none);
+
+  child = nullptr;
+  KJ_EXPECT(!b);
+  maybe = kj::none;
+  maybe2 = kj::none;
+  KJ_EXPECT(!b);
+  maybe3 = kj::none;
+  KJ_EXPECT(b);
+}
+
+KJ_TEST("Maybe<Arc<T>> clone") {
+  bool b = false;
+
+  {
+    Maybe<Arc<AtomicSetTrueInDestructor>> maybe = kj::arc<AtomicSetTrueInDestructor>(&b);
+    const auto& constMaybe = maybe;
+    Maybe<Arc<AtomicSetTrueInDestructor>> clone = constMaybe.clone();
+    KJ_EXPECT(clone != kj::none);
+    KJ_EXPECT(KJ_ASSERT_NONNULL(maybe) == KJ_ASSERT_NONNULL(clone));
+
+    maybe = kj::none;
+    KJ_EXPECT(!b);
+    clone = kj::none;
+    KJ_EXPECT(b);
+
+    Maybe<Arc<AtomicSetTrueInDestructor>> empty;
+    KJ_EXPECT(empty.clone() == kj::none);
+  }
+}
+
 KJ_TEST("atomicAddRef is safe under concurrent reference-count changes") {
   bool destroyed = false;
   auto owner = kj::atomicRefcounted<AtomicSetTrueInDestructor>(&destroyed);
@@ -1770,6 +2047,494 @@ KJ_TEST("Arc polymorphic upcast") {
 
   ref2 = nullptr;
   EXPECT_TRUE(b);
+}
+
+// =======================================================================================
+// UniqueArc
+
+struct IncompleteDeclaredForUniqueArc;
+static_assert(sizeof(UniqueArc<IncompleteDeclaredForUniqueArc>) == 2 * sizeof(void*));
+
+struct IncompleteDeclaredForUniqueArc: public AtomicRefcounted {
+  IncompleteDeclaredForUniqueArc(bool* ptr): ptr(ptr) {}
+  ~IncompleteDeclaredForUniqueArc() { *ptr = true; }
+  bool* ptr;
+};
+
+struct MutableAtomicGadget: public AtomicRefcounted {
+  // An atomically refcounted object with state that is only meaningful to mutate before sharing.
+  MutableAtomicGadget(bool* destroyed): destroyed(destroyed) {}
+  ~MutableAtomicGadget() { *destroyed = true; }
+
+  void setName(kj::StringPtr newName) { name = kj::str(newName); }
+  kj::StringPtr getName() const { return name; }
+
+  kj::Arc<MutableAtomicGadget> newRef() const { return addRefToThis(); }
+
+  kj::String name;
+  int value = 0;
+  bool* destroyed;
+};
+
+KJ_TEST("UniqueArc incomplete declared types") {
+  bool b = false;
+  UniqueArc<IncompleteDeclaredForUniqueArc> ref = kj::uniqueArc<IncompleteDeclaredForUniqueArc>(&b);
+  KJ_EXPECT(!b);
+  ref = nullptr;
+  KJ_EXPECT(b);
+}
+
+KJ_TEST("UniqueArc basic lifecycle and mutation") {
+  bool destroyed = false;
+  {
+    UniqueArc<MutableAtomicGadget> unique = kj::uniqueArc<MutableAtomicGadget>(&destroyed);
+    KJ_EXPECT(unique != nullptr);
+    KJ_EXPECT(!(unique == nullptr));
+    KJ_EXPECT(!unique->isShared());
+
+    // Mutable access through all accessors.
+    unique->setName("gadget");
+    (*unique).value = 42;
+    unique.get()->value += 1;
+    KJ_EXPECT(unique->getName() == "gadget");
+    KJ_EXPECT(unique->value == 43);
+
+    // Const access is also available.
+    const auto& cunique = unique;
+    KJ_EXPECT(cunique->getName() == "gadget");
+    KJ_EXPECT(&*cunique == cunique.get());
+    KJ_EXPECT(&*unique == unique.get());
+
+    KJ_EXPECT(!destroyed);
+  }
+  KJ_EXPECT(destroyed);
+}
+
+KJ_TEST("UniqueArc toArc") {
+  bool destroyed = false;
+
+  UniqueArc<MutableAtomicGadget> unique = kj::uniqueArc<MutableAtomicGadget>(&destroyed);
+  unique->value = 7;
+  const MutableAtomicGadget* ptr = unique.get();
+
+  Arc<MutableAtomicGadget> shared = kj::mv(unique).toArc();
+  KJ_EXPECT(unique == nullptr);
+  KJ_EXPECT(shared != nullptr);
+  KJ_EXPECT(shared.get() == ptr);
+  KJ_EXPECT(shared->value == 7);
+  KJ_EXPECT(!shared->isShared());
+
+  // Behaves like any other Arc from here on.
+  Arc<MutableAtomicGadget> shared2 = shared.addRef();
+  KJ_EXPECT(shared->isShared());
+  Arc<MutableAtomicGadget> shared3 = shared->newRef();
+
+  shared = nullptr;
+  KJ_EXPECT(!destroyed);
+  shared2 = nullptr;
+  KJ_EXPECT(!destroyed);
+  shared3 = nullptr;
+  KJ_EXPECT(destroyed);
+}
+
+#if defined(KJ_ENABLE_IREQUIRE) && KJ_ENABLE_IREQUIRE
+KJ_TEST("UniqueArc toArc on null") {
+  UniqueArc<MutableAtomicGadget> unique;
+  KJ_EXPECT_THROW_MESSAGE("null UniqueArc<> conversion to Arc<>", kj::mv(unique).toArc());
+}
+#endif
+
+static kj::Arc<MutableAtomicGadget> buildGadget(bool* destroyed, kj::StringPtr name) {
+  auto gadget = kj::uniqueArc<MutableAtomicGadget>(destroyed);
+  gadget->setName(name);
+  return kj::mv(gadget);
+}
+
+KJ_TEST("UniqueArc implicit conversion to Arc") {
+  bool destroyed = false;
+  {
+    Arc<MutableAtomicGadget> shared = buildGadget(&destroyed, "built");
+    KJ_EXPECT(shared->getName() == "built");
+    KJ_EXPECT(!shared->isShared());
+
+    // Also via direct initialization from an rvalue.
+    auto unique = kj::uniqueArc<MutableAtomicGadget>(&destroyed);
+    Arc<MutableAtomicGadget> shared2 = kj::mv(unique);
+    KJ_EXPECT(unique == nullptr);
+    KJ_EXPECT(shared2 != nullptr);
+
+    // Conversion to Arc<const T> works too.
+    auto unique3 = kj::uniqueArc<MutableAtomicGadget>(&destroyed);
+    Arc<const MutableAtomicGadget> shared3 = kj::mv(unique3);
+    KJ_EXPECT(unique3 == nullptr);
+    KJ_EXPECT(shared3 != nullptr);
+  }
+  KJ_EXPECT(destroyed);
+}
+
+KJ_TEST("UniqueArc move semantics") {
+  bool destroyed1 = false;
+  bool destroyed2 = false;
+
+  UniqueArc<MutableAtomicGadget> a = kj::uniqueArc<MutableAtomicGadget>(&destroyed1);
+  const MutableAtomicGadget* ptr = a.get();
+
+  UniqueArc<MutableAtomicGadget> b = kj::mv(a);
+  KJ_EXPECT(a == nullptr);
+  KJ_EXPECT(b.get() == ptr);
+
+  // Move-assignment disposes of the previous referent.
+  UniqueArc<MutableAtomicGadget> c = kj::uniqueArc<MutableAtomicGadget>(&destroyed2);
+  c = kj::mv(b);
+  KJ_EXPECT(destroyed2);
+  KJ_EXPECT(!destroyed1);
+  KJ_EXPECT(b == nullptr);
+  KJ_EXPECT(c.get() == ptr);
+
+  // Self-move-assignment is a no-op.
+  auto& cref = c;
+  c = kj::mv(cref);
+  KJ_EXPECT(c.get() == ptr);
+  KJ_EXPECT(!destroyed1);
+
+  c = nullptr;
+  KJ_EXPECT(c == nullptr);
+  KJ_EXPECT(destroyed1);
+}
+
+KJ_TEST("UniqueArc inheritance") {
+  bool b = false;
+
+  UniqueArc<AtomicChild> child = kj::uniqueArc<AtomicChild>(&b);
+  const AtomicChild* ptr = child.get();
+
+  // Up-casting works automatically.
+  UniqueArc<AtomicSetTrueInDestructor> parent = kj::mv(child);
+  KJ_EXPECT(child == nullptr);
+  KJ_EXPECT(parent.get() == ptr);
+
+  // Down-casting is explicit and consumes the source.
+  UniqueArc<AtomicChild> down = parent.downcast<AtomicChild>();
+  KJ_EXPECT(parent == nullptr);
+  KJ_EXPECT(down.get() == ptr);
+
+  // downcast() of a null UniqueArc yields null.
+  UniqueArc<AtomicChild> nullDown = parent.downcast<AtomicChild>();
+  KJ_EXPECT(nullDown == nullptr);
+
+  // Converting to a base Arc works as well.
+  Arc<AtomicSetTrueInDestructor> shared = kj::mv(down);
+  KJ_EXPECT(down == nullptr);
+  KJ_EXPECT(shared.get() == ptr);
+
+  KJ_EXPECT(!b);
+  shared = nullptr;
+  KJ_EXPECT(b);
+}
+
+KJ_TEST("UniqueArc wraps non-atomic-refcounted types") {
+  bool b = false;
+
+  UniqueArc<SetTrueInDestructor2> unique = kj::uniqueArc<SetTrueInDestructor2>(&b);
+  KJ_EXPECT(unique != nullptr);
+  KJ_EXPECT(&*unique == unique.get());
+
+  // Mutation through the wrapper.
+  bool other = false;
+  unique->ptr = &other;
+
+  Arc<SetTrueInDestructor2> shared = kj::mv(unique).toArc();
+  KJ_EXPECT(unique == nullptr);
+  KJ_EXPECT(shared->ptr == &other);
+
+  Arc<SetTrueInDestructor2> shared2 = shared.addRef();
+  shared = nullptr;
+  KJ_EXPECT(!other);
+  shared2 = nullptr;
+  KJ_EXPECT(other);
+  KJ_EXPECT(!b);
+}
+
+KJ_TEST("UniqueArc wraps a value of a non-atomic-refcounted type") {
+  bool b = false;
+
+  UniqueArc<SetTrueInDestructor2> unique = SetTrueInDestructor2(&b);
+  // The temporary has been moved into the wrapper, so its destructor already fired once. Reset so
+  // that we observe the wrapper's destruction below.
+  b = false;
+  KJ_EXPECT(unique != nullptr);
+
+  Arc<SetTrueInDestructor2> shared = kj::mv(unique);
+  KJ_EXPECT(!b);
+  shared = nullptr;
+  KJ_EXPECT(b);
+}
+
+KJ_TEST("UniqueArc<String>") {
+  UniqueArc<String> unique = kj::uniqueArc<String>(kj::str("hello"));
+  KJ_EXPECT(unique->asPtr() == "hello");
+
+  *unique = kj::str("world");
+  KJ_EXPECT(unique->asPtr() == "world");
+
+  Arc<String> shared = kj::mv(unique).toArc();
+  KJ_EXPECT(unique == nullptr);
+  KJ_EXPECT(shared->asPtr() == "world");
+}
+
+KJ_TEST("UniqueArc<Abstract>") {
+  bool b = false;
+
+  UniqueArc<AbstractForArc> unique = kj::uniqueArc<ConcreteForArc>(&b);
+  KJ_EXPECT(unique != nullptr);
+  unique->use();
+
+  Arc<AbstractForArc> shared = kj::mv(unique);
+  KJ_EXPECT(unique == nullptr);
+  shared->use();
+
+  KJ_EXPECT(!b);
+  shared = nullptr;
+  KJ_EXPECT(b);
+}
+
+KJ_TEST("UniqueArc handed off to another thread") {
+  // A UniqueArc may be moved to another thread (like Own<T>), which may then mutate the object and
+  // share it.
+  bool destroyed = false;
+  {
+    auto unique = kj::uniqueArc<MutableAtomicGadget>(&destroyed);
+    unique->value = 1;
+
+    kj::MutexGuarded<kj::Maybe<kj::Arc<MutableAtomicGadget>>> result;
+    {
+      kj::Thread thread([unique = kj::mv(unique), &result]() mutable noexcept {
+        unique->value += 1;
+        unique->setName("from thread");
+        *result.lockExclusive() = kj::mv(unique).toArc();
+      });
+    }
+
+    auto shared = KJ_ASSERT_NONNULL(kj::mv(*result.lockExclusive()));
+    KJ_EXPECT(shared->value == 2);
+    KJ_EXPECT(shared->getName() == "from thread");
+    KJ_EXPECT(!destroyed);
+  }
+  KJ_EXPECT(destroyed);
+}
+
+#if defined(KJ_ENABLE_IREQUIRE) && KJ_ENABLE_IREQUIRE
+KJ_TEST("UniqueArc detects broken uniqueness") {
+  bool destroyed = false;
+  {
+    auto unique = kj::uniqueArc<MutableAtomicGadget>(&destroyed);
+    const auto& cunique = unique;
+    // Raw pointer so that we can observe the object without going through the checking accessors.
+    const MutableAtomicGadget* raw = cunique.get();
+
+    // The object illegally hands out a reference to itself while uniquely owned.
+    Arc<MutableAtomicGadget> leaked = unique->newRef();
+    KJ_EXPECT(raw->isShared());
+
+    // Every accessor, mutable or const, asserts uniqueness.
+    KJ_EXPECT_THROW_MESSAGE("UniqueArc<> is no longer unique", unique->value = 1);
+    KJ_EXPECT_THROW_MESSAGE("UniqueArc<> is no longer unique", (*unique).value = 1);
+    KJ_EXPECT_THROW_MESSAGE("UniqueArc<> is no longer unique", unique.get());
+    KJ_EXPECT_THROW_MESSAGE("UniqueArc<> is no longer unique", cunique->value);
+    KJ_EXPECT_THROW_MESSAGE("UniqueArc<> is no longer unique", (*cunique).value);
+    KJ_EXPECT_THROW_MESSAGE("UniqueArc<> is no longer unique", cunique.get());
+    KJ_EXPECT_THROW_MESSAGE("UniqueArc<> is no longer unique", kj::mv(unique).toArc());
+    // The failed conversion did not consume the UniqueArc.
+    KJ_EXPECT(unique != nullptr);
+
+    // Once the extra reference is gone, uniqueness is restored.
+    leaked = nullptr;
+    KJ_EXPECT(!raw->isShared());
+    KJ_EXPECT(cunique->value == 0);
+    KJ_EXPECT(cunique.get() == raw);
+    unique->value = 2;
+    Arc<MutableAtomicGadget> shared = kj::mv(unique).toArc();
+    KJ_EXPECT(shared->value == 2);
+  }
+  KJ_EXPECT(destroyed);
+
+  UniqueArc<MutableAtomicGadget> nullUnique;
+  KJ_EXPECT_THROW_MESSAGE("null UniqueArc<> dereference", nullUnique->value = 1);
+}
+#endif
+
+// Maybe<UniqueArc<T>> is niche-optimized: a null UniqueArc is the "none" state, so no extra flag is
+// stored.
+static_assert(NicheOptimizable<UniqueArc<MutableAtomicGadget>>);
+static_assert(sizeof(Maybe<UniqueArc<MutableAtomicGadget>>) == sizeof(UniqueArc<MutableAtomicGadget>));
+static_assert(sizeof(Maybe<UniqueArc<IncompleteDeclaredAtomicRefcounted>>) == 2 * sizeof(void*));
+static_assert(sizeof(Maybe<UniqueArc<IncompleteDeclaredNotAtomicRefcounted>>) == 2 * sizeof(void*));
+
+// UniqueArc is move-only, so Maybe<UniqueArc<T>> is not cloneable.
+static_assert(!Cloneable<Maybe<UniqueArc<MutableAtomicGadget>>>);
+
+// Maybe<UniqueArc<T>> does not implicitly convert to a reference to the referent.
+static_assert(!canConvert<Maybe<UniqueArc<MutableAtomicGadget>>&, Maybe<MutableAtomicGadget&>>());
+static_assert(!canConvert<Maybe<UniqueArc<MutableAtomicGadget>>&,
+                          Maybe<const MutableAtomicGadget&>>());
+static_assert(!canConvert<const Maybe<UniqueArc<MutableAtomicGadget>>&,
+                          Maybe<const MutableAtomicGadget&>>());
+static_assert(!canConvert<Maybe<UniqueArc<AtomicChild>>&, Maybe<AtomicSetTrueInDestructor&>>());
+
+KJ_TEST("Maybe<UniqueArc<T>> niche optimization") {
+  bool destroyed = false;
+
+  {
+    Maybe<UniqueArc<MutableAtomicGadget>> maybe;
+    KJ_EXPECT(maybe == kj::none);
+
+    maybe = kj::uniqueArc<MutableAtomicGadget>(&destroyed);
+    KJ_EXPECT(maybe != kj::none);
+    KJ_IF_SOME(ref, maybe) {
+      KJ_EXPECT(ref.get() != nullptr);
+      // Mutable access through the Maybe.
+      ref->value = 5;
+      ref->setName("in maybe");
+      KJ_EXPECT(ref->value == 5);
+      KJ_EXPECT(ref->getName() == "in maybe");
+    } else {
+      KJ_FAIL_EXPECT("expected value");
+    }
+
+    // Moving out leaves the source in the none state.
+    Maybe<UniqueArc<MutableAtomicGadget>> moved = kj::mv(maybe);
+    KJ_EXPECT(maybe == kj::none);
+    KJ_EXPECT(moved != kj::none);
+    KJ_EXPECT(!destroyed);
+
+    // Move-assignment.
+    maybe = kj::mv(moved);
+    KJ_EXPECT(moved == kj::none);
+    KJ_EXPECT(maybe != kj::none);
+    KJ_EXPECT(!destroyed);
+
+    // Setting to none releases the object.
+    maybe = kj::none;
+    KJ_EXPECT(maybe == kj::none);
+    KJ_EXPECT(destroyed);
+  }
+
+  {
+    // Storing a null UniqueArc yields none, consistent with the niche representation.
+    Maybe<UniqueArc<MutableAtomicGadget>> maybe = UniqueArc<MutableAtomicGadget>();
+    KJ_EXPECT(maybe == kj::none);
+    maybe = UniqueArc<MutableAtomicGadget>(nullptr);
+    KJ_EXPECT(maybe == kj::none);
+  }
+
+  {
+    // emplace()
+    destroyed = false;
+    Maybe<UniqueArc<MutableAtomicGadget>> maybe;
+    auto& ref = maybe.emplace(kj::uniqueArc<MutableAtomicGadget>(&destroyed));
+    KJ_EXPECT(ref->destroyed == &destroyed);
+    KJ_EXPECT(maybe != kj::none);
+    KJ_EXPECT(!destroyed);
+
+    // Emplacing over an existing value releases the old one.
+    bool destroyed2 = false;
+    maybe.emplace(kj::uniqueArc<MutableAtomicGadget>(&destroyed2));
+    KJ_EXPECT(destroyed);
+    KJ_EXPECT(!destroyed2);
+    maybe = kj::none;
+    KJ_EXPECT(destroyed2);
+  }
+
+  {
+    // Destructor releases the object.
+    destroyed = false;
+    {
+      Maybe<UniqueArc<MutableAtomicGadget>> maybe = kj::uniqueArc<MutableAtomicGadget>(&destroyed);
+      KJ_EXPECT(!destroyed);
+    }
+    KJ_EXPECT(destroyed);
+  }
+
+  {
+    // Moving the UniqueArc out of the Maybe and sharing it.
+    destroyed = false;
+    Maybe<UniqueArc<MutableAtomicGadget>> maybe = kj::uniqueArc<MutableAtomicGadget>(&destroyed);
+    Arc<MutableAtomicGadget> shared = KJ_ASSERT_NONNULL(kj::mv(maybe)).toArc();
+    KJ_EXPECT(maybe == kj::none);
+    KJ_EXPECT(shared != nullptr);
+    KJ_EXPECT(!destroyed);
+    shared = nullptr;
+    KJ_EXPECT(destroyed);
+  }
+}
+
+KJ_TEST("Maybe<UniqueArc<T>> converting constructor from UniqueArc<Derived>") {
+  bool b = false;
+
+  // Implicit conversion UniqueArc<AtomicChild> -> Maybe<UniqueArc<AtomicSetTrueInDestructor>> via
+  // copy-initialization.
+  auto child = kj::uniqueArc<AtomicChild>(&b);
+  const AtomicChild* ptr = child.get();
+  Maybe<UniqueArc<AtomicSetTrueInDestructor>> maybe = kj::mv(child);
+  KJ_EXPECT(child == nullptr);
+  KJ_EXPECT(maybe != kj::none);
+  KJ_IF_SOME(ref, maybe) {
+    KJ_EXPECT(ref.get() == ptr);
+  }
+
+  // Converting assignment.
+  bool b2 = false;
+  Maybe<UniqueArc<AtomicSetTrueInDestructor>> maybe2;
+  maybe2 = kj::uniqueArc<AtomicChild>(&b2);
+  KJ_EXPECT(maybe2 != kj::none);
+
+  // Maybe<UniqueArc<AtomicChild>> -> Maybe<UniqueArc<AtomicSetTrueInDestructor>>.
+  bool b3 = false;
+  Maybe<UniqueArc<AtomicChild>> maybeChild = kj::uniqueArc<AtomicChild>(&b3);
+  Maybe<UniqueArc<AtomicSetTrueInDestructor>> maybe3 = kj::mv(maybeChild);
+  KJ_EXPECT(maybeChild == kj::none);
+  KJ_EXPECT(maybe3 != kj::none);
+
+  KJ_EXPECT(!b);
+  maybe = kj::none;
+  KJ_EXPECT(b);
+  KJ_EXPECT(!b2);
+  maybe2 = kj::none;
+  KJ_EXPECT(b2);
+  KJ_EXPECT(!b3);
+  maybe3 = kj::none;
+  KJ_EXPECT(b3);
+}
+
+KJ_TEST("Maybe<Arc<T>> converting constructor from UniqueArc") {
+  // Since UniqueArc<U> implicitly converts to Arc<T>, it also implicitly converts to Maybe<Arc<T>>.
+  bool destroyed = false;
+
+  auto unique = kj::uniqueArc<MutableAtomicGadget>(&destroyed);
+  unique->value = 9;
+  const MutableAtomicGadget* ptr = unique.get();
+
+  Maybe<Arc<MutableAtomicGadget>> maybe = kj::mv(unique);
+  KJ_EXPECT(unique == nullptr);
+  KJ_IF_SOME(ref, maybe) {
+    KJ_EXPECT(ref.get() == ptr);
+    KJ_EXPECT(ref->value == 9);
+  } else {
+    KJ_FAIL_EXPECT("expected value");
+  }
+
+  // Converting assignment, including up-casting.
+  bool b = false;
+  Maybe<Arc<AtomicSetTrueInDestructor>> maybe2;
+  maybe2 = kj::uniqueArc<AtomicChild>(&b);
+  KJ_EXPECT(maybe2 != kj::none);
+
+  KJ_EXPECT(!destroyed);
+  maybe = kj::none;
+  KJ_EXPECT(destroyed);
+  KJ_EXPECT(!b);
+  maybe2 = kj::none;
+  KJ_EXPECT(b);
 }
 
 // A refcounted object that holds a self weak-reference and touches it from its destructor. This
