@@ -35,12 +35,6 @@
 #include <exception>
 #include <stdlib.h>
 
-#include "miniposix.h"
-
-#if !_WIN32
-#include <sys/wait.h>
-#endif
-
 namespace kj {
 namespace _ {  // private
 namespace {
@@ -60,101 +54,14 @@ public:
 
   kj::String text;
 
-  int outputPipe = -1;
-
-  bool forkForDeathTest() {
-    // This is called when exceptions are disabled.  We fork the process instead and then expect
-    // the child to die.
-
-#if _WIN32
-    // Windows doesn't support fork() or anything like it. Just skip the test.
-    return false;
-
-#else
-    int pipeFds[2]{};
-    KJ_SYSCALL(pipe(pipeFds));
-    pid_t child = fork();
-    if (child == 0) {
-      // This is the child!
-      close(pipeFds[0]);
-      outputPipe = pipeFds[1];
-      text = kj::String();
-      return true;
-    } else {
-      close(pipeFds[1]);
-
-      // Read child error messages into our local buffer.
-      char buf[1024]{};
-      for (;;) {
-        ssize_t n = read(pipeFds[0], buf, sizeof(buf));
-        if (n < 0) {
-          if (errno == EINTR) {
-            continue;
-          } else {
-            break;
-          }
-        } else if (n == 0) {
-          break;
-        } else {
-          text = kj::str(text, kj::StringPtr(buf, n));
-        }
-      }
-
-      close(pipeFds[0]);
-
-      // Get exit status.
-      int status;
-      KJ_SYSCALL(waitpid(child, &status, 0));
-
-      EXPECT_TRUE(WIFEXITED(status));
-      EXPECT_EQ(74, WEXITSTATUS(status));
-
-      return false;
-    }
-#endif  // _WIN32, else
-  }
-
-  void flush() {
-    if (outputPipe != -1) {
-      const char* pos = &*text.begin();
-      const char* end = pos + text.size();
-
-      while (pos < end) {
-        miniposix::ssize_t n = miniposix::write(outputPipe, pos, end - pos);
-        if (n < 0) {
-          if (errno == EINTR) {
-            continue;
-          } else {
-            break;  // Give up on error.
-          }
-        }
-        pos += n;
-      }
-
-      text = kj::String();
-    }
-  }
-
-  void onRecoverableException(Exception&& exception) override {
+  void onException(Exception&& exception) override {
     auto what = str(exception);
     // Discard the stack trace.
     KJ_IF_SOME(end, what.find("\nstack: ")) {
-      text = kj::str(text, "recoverable exception: ", what.first(end), '\n');
+      text = kj::str(text, "exception: ", what.first(end), '\n');
     } else {
-      text = kj::str(text, "recoverable exception: ", what, '\n');
+      text = kj::str(text, "exception: ", what, '\n');
     }
-    flush();
-  }
-
-  void onFatalException(Exception&& exception) override {
-    auto what = str(exception);
-    // Discard the stack trace.
-    KJ_IF_SOME(end, what.find("\nstack: ")) {
-      text = kj::str(text, "fatal exception: ", what.first(end), '\n');
-    } else {
-      text = kj::str(text, "fatal exception: ", what, '\n');
-    }
-    flush();
     throw MockException();
   }
 
@@ -235,18 +142,19 @@ TEST(Debug, Log) {
 
   EXPECT_LOG_EQ([&](){
     EXPECT_FATAL(KJ_ASSERT(1 == 2)); line = __LINE__;
-  }, kj::str("fatal exception: ", fileLine(__FILE__, line), ": failed: expected 1 == 2 [1 == 2]\n"));
+  }, kj::str("exception: ", fileLine(__FILE__, line), ": failed: expected 1 == 2 [1 == 2]\n"));
 
   KJ_ASSERT(1 == 1) {
     ADD_FAILURE() << "Shouldn't call recovery code when check passes.";
     break;
   };
 
+  // The recovery block runs before the exception is thrown.
   bool recovered = false;
   EXPECT_LOG_EQ([&](){
-    KJ_ASSERT(1 == 2, "1 is not 2") { recovered = true; break; } line = __LINE__;
+    EXPECT_FATAL(KJ_ASSERT(1 == 2, "1 is not 2") { recovered = true; break; }); line = __LINE__;
   }, kj::str(
-    "recoverable exception: ", fileLine(__FILE__, line), ": "
+    "exception: ", fileLine(__FILE__, line), ": "
     "failed: expected 1 == 2 [1 == 2]; 1 is not 2\n"
   ));
   EXPECT_TRUE(recovered);
@@ -254,20 +162,20 @@ TEST(Debug, Log) {
   EXPECT_LOG_EQ([&](){
     EXPECT_FATAL(KJ_ASSERT(1 == 2, i, "hi", str)); line = __LINE__;
   }, kj::str(
-    "fatal exception: ", fileLine(__FILE__, line), ": "
+    "exception: ", fileLine(__FILE__, line), ": "
         "failed: expected 1 == 2 [1 == 2]; i = 123; hi; str = foo\n"
   ));
 
   EXPECT_LOG_EQ([&](){
     EXPECT_FATAL(KJ_REQUIRE(1 == 2, i, "hi", str)); line = __LINE__;
   }, kj::str(
-    "fatal exception: ", fileLine(__FILE__, line), ": "
+    "exception: ", fileLine(__FILE__, line), ": "
         "failed: expected 1 == 2 [1 == 2]; i = 123; hi; str = foo\n"
   ));
 
   EXPECT_LOG_EQ([&](){
     EXPECT_FATAL(KJ_FAIL_ASSERT("foo")); line = __LINE__;
-  }, kj::str("fatal exception: ", fileLine(__FILE__, line), ": failed: foo\n"));
+  }, kj::str("exception: ", fileLine(__FILE__, line), ": failed: foo\n"));
 }
 
 // Testing KJ_LOG_AT, etc. macros:
@@ -325,40 +233,40 @@ TEST(Debug, LogAt) {
   expectLogEq([&](){
     expectFatal([&](){ myRequire(1 == 2); }); line = __LINE__;
   }, [&](){
-    return kj::str("fatal exception: ", fileLine(__FILE__, line), ": "
+    return kj::str("exception: ", fileLine(__FILE__, line), ": "
         "failed: expected cond; a_message\n");
   });
 
   expectLogEq([&](){
     expectFatal([&](){ myFailRequire(); }); line = __LINE__;
   }, [&](){
-    return kj::str("fatal exception: ", fileLine(__FILE__, line), ": failed: a_message\n");
+    return kj::str("exception: ", fileLine(__FILE__, line), ": failed: a_message\n");
   });
 
   expectLogEq([&](){
     expectFatal([&](){ myRequireNonnull(kj::none); }); line = __LINE__;
   }, [&](){
-    return kj::str("fatal exception: ", fileLine(__FILE__, line), ": "
+    return kj::str("exception: ", fileLine(__FILE__, line), ": "
         "failed: expected value != nullptr; a_message\n");
   });
 
   expectLogEq([&](){
     expectFatal([&](){ myAssert(1 == 2); }); line = __LINE__;
   }, [&](){
-    return kj::str("fatal exception: ", fileLine(__FILE__, line), ": "
+    return kj::str("exception: ", fileLine(__FILE__, line), ": "
         "failed: expected cond; a_message\n");
   });
 
   expectLogEq([&](){
     expectFatal([&](){ myFailAssert(); }); line = __LINE__;
   }, [&](){
-    return kj::str("fatal exception: ", fileLine(__FILE__, line), ": failed: a_message\n");
+    return kj::str("exception: ", fileLine(__FILE__, line), ": failed: a_message\n");
   });
 
   expectLogEq([&](){
     expectFatal([&](){ myAssertNonnull(kj::none); }); line = __LINE__;
   }, [&](){
-    return kj::str("fatal exception: ", fileLine(__FILE__, line), ": "
+    return kj::str("exception: ", fileLine(__FILE__, line), ": "
         "failed: expected value != nullptr; a_message\n");
   });
 }
@@ -452,7 +360,7 @@ TEST(Debug, Syscall) {
   EXPECT_LOG_EQ([&](){
     EXPECT_FATAL(KJ_SYSCALL(mockSyscall(-1, EBADF), i, "bar", str)); line = __LINE__;
   }, kj::str(
-    "fatal exception: ", fileLine(__FILE__, line),
+    "exception: ", fileLine(__FILE__, line),
         ": failed: mockSyscall(-1, EBADF): ", strerror(EBADF),
         "; i = 123; bar; str = foo\n"
   ));
@@ -460,7 +368,7 @@ TEST(Debug, Syscall) {
   EXPECT_LOG_EQ([&](){
     EXPECT_FATAL(KJ_SYSCALL(mockSyscall(-1, ECONNRESET), i, "bar", str)); line = __LINE__;
   }, kj::str(
-    "fatal exception: ", fileLine(__FILE__, line),
+    "exception: ", fileLine(__FILE__, line),
         ": disconnected: mockSyscall(-1, ECONNRESET): ", strerror(ECONNRESET),
         "; i = 123; bar; str = foo\n"
   ));
@@ -468,7 +376,7 @@ TEST(Debug, Syscall) {
   EXPECT_LOG_EQ([&](){
     EXPECT_FATAL(KJ_SYSCALL(mockSyscall(-1, ENOMEM), i, "bar", str)); line = __LINE__;
   }, kj::str(
-    "fatal exception: ", fileLine(__FILE__, line),
+    "exception: ", fileLine(__FILE__, line),
         ": overloaded: mockSyscall(-1, ENOMEM): ", strerror(ENOMEM),
         "; i = 123; bar; str = foo\n"
   ));
@@ -476,7 +384,7 @@ TEST(Debug, Syscall) {
   EXPECT_LOG_EQ([&](){
     EXPECT_FATAL(KJ_SYSCALL(mockSyscall(-1, ENOSYS), i, "bar", str)); line = __LINE__;
   }, kj::str(
-    "fatal exception: ", fileLine(__FILE__, line),
+    "exception: ", fileLine(__FILE__, line),
         ": unimplemented: mockSyscall(-1, ENOSYS): ", strerror(ENOSYS),
         "; i = 123; bar; str = foo\n"
   ));
@@ -484,9 +392,9 @@ TEST(Debug, Syscall) {
   int result = 0;
   bool recovered = false;
   EXPECT_LOG_EQ([&](){
-    KJ_SYSCALL(result = mockSyscall(-2, EBADF), i, "bar", str) { recovered = true; break; } line = __LINE__;
+    EXPECT_FATAL(KJ_SYSCALL(result = mockSyscall(-2, EBADF), i, "bar", str) { recovered = true; break; }); line = __LINE__;
   }, kj::str(
-    "recoverable exception: ", fileLine(__FILE__, line),
+    "exception: ", fileLine(__FILE__, line),
         ": failed: mockSyscall(-2, EBADF): ", strerror(EBADF),
         "; i = 123; bar; str = foo\n"
   ));
@@ -508,7 +416,7 @@ TEST(Debug, Context) {
   }, kj::str(
     "log message: ", fileLine(__FILE__, cline), ":+0: info: context: foo\n\n"
         "log message: ", fileLine(__FILE__, line), ":+1: warning: blah\n"
-        "fatal exception: ", fileLine(__FILE__, cline), ": context: foo\n",
+        "exception: ", fileLine(__FILE__, cline), ": context: foo\n",
         fileLine(__FILE__, line2), ": failed: bar\n"
   ));
 
@@ -522,7 +430,7 @@ TEST(Debug, Context) {
       EXPECT_FATAL(KJ_FAIL_ASSERT("bar")); line = __LINE__;
     }
   }, kj::str(
-    "fatal exception: ", fileLine(__FILE__, cline), ": context: foo\n",
+    "exception: ", fileLine(__FILE__, cline), ": context: foo\n",
     fileLine(__FILE__, cline2), ": context: baz; i = 123; corge; str = qux\n",
     fileLine(__FILE__, line), ": failed: bar\n"
   ));
@@ -539,7 +447,7 @@ TEST(Debug, Context) {
       EXPECT_FATAL(KJ_FAIL_ASSERT("bar")); line = __LINE__;
     }
   }, kj::str(
-    "fatal exception: ", fileLine(__FILE__, cline), ": context: foo\n",
+    "exception: ", fileLine(__FILE__, cline), ": context: foo\n",
     fileLine(__FILE__, cline2), ": context: grault\n",
     fileLine(__FILE__, line), ": failed: bar\n"
   ));

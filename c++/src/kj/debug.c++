@@ -241,7 +241,7 @@ static String makeDescriptionImpl(DescriptionStyle style, const char* code, int 
   if (style == SYSCALL) {
     // Strip off leading "foo = " from code, since callers will sometimes write things like:
     //   ssize_t n;
-    //   RECOVERABLE_SYSCALL(n = read(fd, buffer, sizeof(buffer))) { return ""; }
+    //   KJ_SYSCALL(n = read(fd, buffer, sizeof(buffer)));
     //   return std::string(buffer, n);
     const char* equalsPos = strchr(code, '=');
     if (equalsPos != nullptr && equalsPos[1] != '=') {
@@ -486,17 +486,11 @@ Maybe<Debug::Context::Value> Debug::Context::ensureInitialized() {
   }
 }
 
-void Debug::Context::onRecoverableException(Exception&& exception) {
+void Debug::Context::onException(Exception&& exception) {
   KJ_IF_SOME(v, ensureInitialized()) {
     exception.wrapContext(v.file, v.line, mv(v.description));
   }
-  next.onRecoverableException(kj::mv(exception));
-}
-void Debug::Context::onFatalException(Exception&& exception) {
-  KJ_IF_SOME(v, ensureInitialized()) {
-    exception.wrapContext(v.file, v.line, mv(v.description));
-  }
-  next.onFatalException(kj::mv(exception));
+  next.onException(kj::mv(exception));
 }
 void Debug::Context::logMessage(LogSeverity severity, const char* file, int line, int contextDepth,
                                 String&& text) {

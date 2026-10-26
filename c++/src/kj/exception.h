@@ -280,11 +280,9 @@ enum class LogSeverity {
 StringPtr KJ_STRINGIFY(LogSeverity severity);
 
 class ExceptionCallback {
-  // If you don't like C++ exceptions, you may implement and register an ExceptionCallback in order
-  // to perform your own exception handling.  For example, a reasonable thing to do is to have
-  // onRecoverableException() set a flag indicating that an error occurred, and then check for that
-  // flag just before writing to storage and/or returning results to the user.  If the flag is set,
-  // discard whatever you have and return an error instead.
+  // An ExceptionCallback may be implemented and registered in order to customize how exceptions
+  // are thrown and how log messages are written.  For example, a callback might annotate
+  // exceptions with additional context before they are thrown, or redirect log output.
   //
   // ExceptionCallbacks must always be allocated on the stack.  When an exception is thrown, the
   // newest ExceptionCallback on the calling thread's stack is called.  The default implementation
@@ -297,18 +295,11 @@ public:
   KJ_DISALLOW_COPY_AND_MOVE(ExceptionCallback);
   virtual ~ExceptionCallback() noexcept(false);
 
-  virtual void onRecoverableException(Exception&& exception);
-  // Called when an exception has been raised, but the calling code has the ability to continue by
-  // producing garbage output.  This method _should_ throw the exception, but is allowed to simply
-  // return if garbage output is acceptable.
-  //
-  // The global default implementation throws an exception, unless we're currently in a destructor
-  // unwinding due to another exception being thrown, in which case it logs an error and returns.
-
-  virtual void onFatalException(Exception&& exception);
-  // Called when an exception has been raised and the calling code cannot continue.  If this method
-  // returns normally, abort() will be called.  The method must throw the exception to avoid
-  // aborting.
+  virtual void onException(Exception&& exception);
+  // Called when an exception has been raised by `kj::throwFatalException()` or
+  // `kj::throwRecoverableException()`.  The method must throw the exception: if it returns
+  // normally, abort() will be called.  (`throwRecoverableException()` logs what this method throws
+  // instead of letting it escape if the stack is already unwinding.)
   //
   // The global default implementation throws an exception.
 
@@ -369,8 +360,9 @@ KJ_NOINLINE KJ_NORETURN(void throwFatalException(kj::Exception&& exception, uint
 // TODO(2.0): Rename this to `throwException()`.
 
 KJ_NOINLINE void throwRecoverableException(kj::Exception&& exception, uint ignoreCount = 0);
-// Invoke the exception callback to throw the given recoverable exception.  If the exception
-// callback returns, return normally.
+// Invoke the exception callback to throw the given exception, unless the stack is already
+// unwinding due to another exception, in which case the exception is logged and this returns
+// normally.
 //
 // TODO(2.0): Rename this to `throwExceptionUnlessUnwinding()`. (Or, can we fix the unwind problem
 //   and be able to remove this entirely?)
