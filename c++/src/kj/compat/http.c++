@@ -5793,7 +5793,6 @@ public:
         "this HttpClient's connection has been closed by the server or due to an error");
     KJ_REQUIRE(httpOutput.canReuse(),
         "can't start new request until previous request body has been fully written");
-    closeWatcherTask = kj::none;
 
     kj::String lengthStr;
     kj::StringPtr connectionHeaders[HttpHeaders::CONNECTION_HEADERS_COUNT];
@@ -5825,7 +5824,11 @@ public:
       }
     }
 
-    httpOutput.writeHeaders(headers.serializeRequest(method, url, connectionHeaders));
+    // Serialize before dropping the close watcher: serializeRequest() throws for an invalid URL,
+    // and the connection must then stay as usable as it was.
+    auto headerText = headers.serializeRequest(method, url, connectionHeaders);
+    closeWatcherTask = kj::none;
+    httpOutput.writeHeaders(kj::mv(headerText));
 
     kj::Own<kj::AsyncOutputStream> bodyStream;
     if (!hasBody) {
@@ -6862,14 +6865,6 @@ private:
   using HostMap = std::map<kj::String, Host, HostnameLess>;
   HostMap httpHosts;
   HostMap httpsHosts;
-
-  struct RequestInfo {
-    HttpMethod method;
-    kj::String hostname;
-    kj::String path;
-    HttpHeaders headers;
-    kj::Maybe<uint64_t> expectedBodySize;
-  };
 
   kj::TaskSet tasks;
 

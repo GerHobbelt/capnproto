@@ -6459,6 +6459,21 @@ KJ_TEST("HttpClient connection management") {
   doRequest().wait(waitScope);
   KJ_EXPECT(count == 1);
   KJ_EXPECT(cumulative == 9);
+
+  // A request refused before anything is sent (here, for an invalid URL) leaves its connection in
+  // the pool, and we must still notice when the server times that connection out.
+  waitScope.poll();
+  KJ_EXPECT_THROW_MESSAGE("invalid request URL",
+      client->request(HttpMethod::GET, "/foo bar", HttpHeaders(headerTable)));
+  serverTimer.advanceTo(serverTimer.now() + serverSettings.pipelineTimeout * 2);
+  waitScope.poll();
+  KJ_EXPECT(count == 0);
+  KJ_EXPECT(cumulative == 9);
+
+  // So the next request gets a new connection.
+  doRequest().wait(waitScope);
+  KJ_EXPECT(count == 1);
+  KJ_EXPECT(cumulative == 10);
 }
 
 KJ_TEST("HttpClient disable connection reuse") {
@@ -7852,33 +7867,6 @@ private:
   kj::TimerImpl timer;
   SimpleHttpService tunneledService;
   HttpServer server;
-};
-
-class ConnectCloseService final: public HttpService {
-  // A simple CONNECT server that will accept a connection then immediately
-  // shutdown the write side of the AsyncIoStream to simulate socket disconnection.
-public:
-  ConnectCloseService(HttpHeaderTable& headerTable)
-      : headerTable(headerTable) {}
-
-  kj::Promise<void> request(
-      HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
-      kj::AsyncInputStream& requestBody, Response& response) override {
-    KJ_UNIMPLEMENTED("Regular HTTP requests are not implemented here.");
-  }
-
-  kj::Promise<void> connect(kj::StringPtr host,
-                            const HttpHeaders& headers,
-                            kj::AsyncIoStream& connection,
-                            ConnectResponse& response,
-                            kj::HttpConnectSettings settings) override {
-    response.accept(200, "OK", HttpHeaders(headerTable));
-    connection.shutdownWrite();
-    return kj::READY_NOW;
-  }
-
-private:
-  HttpHeaderTable& headerTable;
 };
 
 KJ_TEST("Simple CONNECT Server works") {
